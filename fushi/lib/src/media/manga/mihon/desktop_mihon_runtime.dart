@@ -58,7 +58,7 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     MihonCookieJar? cookieJar,
   })  : resourceDirectory = resourceDirectory ?? _defaultResourceDirectory(),
         _processContainment = MihonChildProcessContainment.platform(),
-        _http = httpClient ?? http.Client(),
+        _http = httpClient ?? _NoKeepAliveClient(httpClient ?? http.Client()),
         _cookies = cookieJar ?? MihonCookieJar.shared;
 
   final Directory dataDirectory;
@@ -957,5 +957,16 @@ class _SidecarLogSink {
     } on Object {
       // 关闭失败无所谓：进程已经退出，文件由 OS 收尾。
     }
+  }
+}
+
+
+class _NoKeepAliveClient extends http.BaseClient {
+  final http.Client _inner;
+  _NoKeepAliveClient(this._inner);
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) {
+    request.persistentConnection = false;
+    return _inner.send(request);
   }
 }
