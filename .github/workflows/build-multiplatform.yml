@@ -1765,22 +1765,16 @@ jobs:
       - name: Bundle debug VC++ runtime (so the debug exe runs without Visual Studio)
         shell: pwsh
         run: |
+          $dest = "fushi\build\windows\x64\runner\Debug"
           $vs = "C:\Program Files\Microsoft Visual Studio\2022"
           $crtDirs = Get-ChildItem "$vs\*\VC\Redist\MSVC\*\debug_nonredist\x64\Microsoft.VC14*.DebugCRT" -Directory -ErrorAction SilentlyContinue
-          if (-not $crtDirs) {
-            Write-Error "debug VC++ CRT not found on runner"
-            exit 1
-          }
-          $dest = "fushi\build\windows\x64\runner\Debug"
-          foreach ($d in $crtDirs) {
-            Copy-Item -Path "$d\*" -Destination $dest -Force
-            Write-Output "copied debug CRT from $($d.FullName)"
-          }
+          if (-not $crtDirs) { Write-Error "debug MSVC CRT not found on runner"; exit 1 }
+          foreach ($d in $crtDirs) { Copy-Item -Path "$d\*" -Destination $dest -Force; Write-Output "copied MSVC debug CRT from $($d.FullName)" }
+          $ucrt = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter ucrtbased.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $ucrt) { $ucrt = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022" -Recurse -Filter ucrtbased.dll -ErrorAction SilentlyContinue | Select-Object -First 1 }
+          if ($ucrt) { Copy-Item -Path $ucrt.FullName -Destination $dest -Force; Write-Output "copied $($ucrt.FullName)" } else { Write-Error "ucrtbased.dll not found on runner"; exit 1 }
           foreach ($req in @("vcruntime140d.dll","msvcp140d.dll","ucrtbased.dll")) {
-            if (-not (Test-Path -LiteralPath (Join-Path $dest $req) -PathType Leaf)) {
-              Write-Error "missing debug runtime: $req"
-              exit 1
-            }
+            if (-not (Test-Path -LiteralPath (Join-Path $dest $req) -PathType Leaf)) { Write-Error "missing debug runtime: $req"; exit 1 }
           }
       - name: Upload Windows Debug app bundle (keep-alive fix build)
         if: always()
