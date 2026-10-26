@@ -1762,6 +1762,26 @@ jobs:
           mode: save
           name: ${{ steps.native_store.outputs.anki_sync_debug }}
           path: native\fushi_anki_sync\target\debug\fushi-anki-sync.exe
+      - name: Bundle debug VC++ runtime (so the debug exe runs without Visual Studio)
+        shell: pwsh
+        run: |
+          $vs = "C:\Program Files\Microsoft Visual Studio\2022"
+          $crtDirs = Get-ChildItem "$vs\*\VC\Redist\MSVC\*\debug_nonredist\x64\Microsoft.VC14*.DebugCRT" -Directory -ErrorAction SilentlyContinue
+          if (-not $crtDirs) {
+            Write-Error "debug VC++ CRT not found on runner"
+            exit 1
+          }
+          $dest = "fushi\build\windows\x64\runner\Debug"
+          foreach ($d in $crtDirs) {
+            Copy-Item -Path "$d\*" -Destination $dest -Force
+            Write-Output "copied debug CRT from $($d.FullName)"
+          }
+          foreach ($req in @("vcruntime140d.dll","msvcp140d.dll","ucrtbased.dll")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $dest $req) -PathType Leaf)) {
+              Write-Error "missing debug runtime: $req"
+              exit 1
+            }
+          }
       - name: Upload Windows Debug app bundle (keep-alive fix build)
         if: always()
         uses: actions/upload-artifact@v7
