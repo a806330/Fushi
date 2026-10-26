@@ -1767,10 +1767,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: win-x64-fushi-debug-bundle
-          path: fushiuild\windowsdunner\Debug
+          path: fushi/build/windows/x64/runner/Debug
           if-no-files-found: warn
           retention-days: 7
-
       - name: Run Windows comprehensive automation contract
         id: windows_smoke
         run: .\ci\comprehensive-test.ps1 -Platform windows -Only appSmoke
