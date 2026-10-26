@@ -1762,6 +1762,15 @@ jobs:
           mode: save
           name: ${{ steps.native_store.outputs.anki_sync_debug }}
           path: native\fushi_anki_sync\target\debug\fushi-anki-sync.exe
+      - name: Upload Windows Debug app bundle (keep-alive fix build)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: win-x64-fushi-debug-bundle
+          path: fushiuild\windowsdunner\Debug
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Run Windows comprehensive automation contract
         id: windows_smoke
         run: .\ci\comprehensive-test.ps1 -Platform windows -Only appSmoke
