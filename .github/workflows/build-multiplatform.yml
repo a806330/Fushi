@@ -1770,12 +1770,21 @@ jobs:
           $crtDirs = Get-ChildItem "$vs\*\VC\Redist\MSVC\*\debug_nonredist\x64\Microsoft.VC14*.DebugCRT" -Directory -ErrorAction SilentlyContinue
           if (-not $crtDirs) { Write-Error "debug MSVC CRT not found on runner"; exit 1 }
           foreach ($d in $crtDirs) { Copy-Item -Path "$d\*" -Destination $dest -Force; Write-Output "copied MSVC debug CRT from $($d.FullName)" }
-          $ucrt = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter ucrtbased.dll -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $ucrt) { $ucrt = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022" -Recurse -Filter ucrtbased.dll -ErrorAction SilentlyContinue | Select-Object -First 1 }
-          if ($ucrt) { Copy-Item -Path $ucrt.FullName -Destination $dest -Force; Write-Output "copied $($ucrt.FullName)" } else { Write-Error "ucrtbased.dll not found on runner"; exit 1 }
+          $ucrt = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter ucrtbased.dll -ErrorAction SilentlyContinue | Where-Object { $_.FullName -like "*\x64\*" } | Select-Object -First 1
+          if (-not $ucrt) { $ucrt = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022" -Recurse -Filter ucrtbased.dll -ErrorAction SilentlyContinue | Where-Object { $_.FullName -like "*\x64\*" } | Select-Object -First 1 }
+          if ($ucrt) { Copy-Item -Path $ucrt.FullName -Destination $dest -Force; Write-Output "copied x64 ucrtbased from $($ucrt.FullName)" } else { Write-Error "x64 ucrtbased.dll not found on runner"; exit 1 }
           foreach ($req in @("vcruntime140d.dll","msvcp140d.dll","ucrtbased.dll")) {
             if (-not (Test-Path -LiteralPath (Join-Path $dest $req) -PathType Leaf)) { Write-Error "missing debug runtime: $req"; exit 1 }
           }
+          $fs = [IO.File]::OpenRead((Join-Path $dest "ucrtbased.dll"))
+          $br = New-Object IO.BinaryReader($fs)
+          $fs.Seek(0x3C, 'Begin') | Out-Null
+          $pe = $br.ReadInt32()
+          $fs.Seek($pe + 4, 'Begin') | Out-Null
+          $mach = $br.ReadUInt16()
+          $fs.Close()
+          if ($mach -ne 0x8664) { Write-Error "ucrtbased.dll wrong architecture 0x$($mach.ToString('X4'))"; exit 1 }
+          Write-Output "ucrtbased.dll architecture check OK (x64)"
       - name: Upload Windows Debug app bundle (keep-alive fix build)
         if: always()
         uses: actions/upload-artifact@v7
