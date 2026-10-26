@@ -5,27 +5,22 @@ on:
 
 jobs:
   dump:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - name: Collect x64 debug CRT files
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path crt -Force | Out-Null
-          $vsRoot = "C:/Program Files/Microsoft Visual Studio/2022"
-          if (Test-Path $vsRoot) {
-            Get-ChildItem $vsRoot -Directory | ForEach-Object {
-              $d = Get-ChildItem "$($_.FullName)/VC/Redist/MSVC/*/debug_nonredist/x64/Microsoft.VC14*.DebugCRT" -Directory -ErrorAction SilentlyContinue
-              foreach ($x in $d) { Copy-Item "$($x.FullName)/*" -Destination crt -Force }
-            }
-          }
-          $sdkRoot = "C:/Program Files (x86)/Windows Kits/10/bin"
-          if (Test-Path $sdkRoot) {
-            Get-ChildItem $sdkRoot -Directory | ForEach-Object {
-              $p = Join-Path $_.FullName "x64/ucrtbased.dll"
-              if (Test-Path $p) { Copy-Item $p -Destination crt -Force }
-            }
-          }
+          $found = @()
+          Get-ChildItem "C:/Program Files/Microsoft Visual Studio" -Recurse -Directory -Filter "Microsoft.VC14*.DebugCRT" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -like "*\x64\*" } |
+            ForEach-Object { Copy-Item "$($_.FullName)/*" -Destination crt -Force; $found += $_.FullName }
+          Get-ChildItem "C:/Program Files (x86)/Windows Kits/10/bin" -Recurse -Filter "ucrtbased.dll" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -like "*\x64\*" } |
+            ForEach-Object { Copy-Item $_.FullName -Destination crt -Force; $found += $_.FullName }
+          $found | Out-File crt/found.txt
           Get-ChildItem crt | ForEach-Object { "$($_.Name) $($_.Length)" } | Out-File crt/listing.txt
+          Write-Output "collected $($found.Count) source locations"
       - name: Upload CRT bundle
         uses: actions/upload-artifact@v4
         with:
