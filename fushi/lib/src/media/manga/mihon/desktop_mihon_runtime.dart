@@ -13,6 +13,9 @@ import 'package:fushi/src/media/manga/mihon/mihon_child_process_containment.dart
 import 'package:fushi/src/media/manga/mihon/mihon_cloudflare_gate.dart';
 import 'package:fushi/src/media/manga/cookie/manga_cookie_jar.dart';
 import 'package:fushi/src/media/manga/mihon/mihon_cookie_jar.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_cf_cert_manager.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_cf_webview2_fetch_proxy.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_cf_webview2_fetcher.dart';
 import 'package:fushi/src/media/manga/mihon/mihon_models.dart';
 import 'package:fushi/src/media/manga/mihon/mihon_runtime.dart';
 import 'package:fushi/src/media/manga/mihon/mihon_proxy_policy_server.dart';
@@ -80,6 +83,11 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
   Future<void>? _starting;
   bool _disposed = false;
   MihonProxyPolicyServer? _proxyPolicy;
+  // CF 代发（内置 WebView2）：本地 relay + 证书管理器。仅当 relay 成功起来且合并信任库
+  // 生成成功时，才把 relay 端口喂给 proxyPolicy（③路由）并给 JVM 挂 trustStore（④）；
+  // 任一失败 → 不启用代发，行为等同现状（绝不比现状差）。
+  MihonCfFetchProxy? _cfFetchProxy;
+  MihonCfCertManager? _cfCertManager;
   final Map<String, _CachedApk> _apkCache = <String, _CachedApk>{};
   final Map<String, http.Client> _imageClients = <String, http.Client>{};
   int _imageRequestSequence = 0;
@@ -438,6 +446,15 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     await log?.close();
     await _proxyPolicy?.close();
     _proxyPolicy = null;
+    // CF 代发（内置 WebView2）回收：关掉本地 relay + 各 host TLS 端点 + 销毁取数 WebView。
+    // 失败不影响 sidecar 收尾（代发是可降级的附加能力，不连累关停）。
+    try {
+      await _cfFetchProxy?.stop();
+    } on Object {
+      // ignore
+    }
+    _cfFetchProxy = null;
+    _cfCertManager = null;
   }
 
   Future<void> _ensureStarted() async {
@@ -481,8 +498,59 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
       List<int>.generate(32, (_) => random.nextInt(256)),
     ).replaceAll('=', '');
     await _proxyPolicy?.close();
-    final MihonProxyPolicyServer proxyPolicy =
-        await MihonProxyPolicyServer.start(token);
+
+    // 重启前回收上一轮的 CF 代发 relay（连同其 per-host TLS 端点 + WebView 取数器）：
+    // stop() 内部会调 fetcher.dispose()，否则旧端口 / socket / renderer 都泄漏。
+    // 首次 _start() 时 _cfFetchProxy 为 null，这是空操作，安全。
+    try {
+      await _cfFetchProxy?.stop();
+    } on Object {
+      // ignore
+    }
+    _cfFetchProxy = null;
+    _cfCertManager = null;
+
+    // ---- CF 代发（内置 WebView2）接线：起本地 relay + 生成合并信任库 ----
+    // 全部 best-effort：任一环节失败 → 不启用代发（proxyPolicy 拿不到 cf 端口、
+    // JVM 不挂 trustStore），行为等同现状。绝不因代发未就绪拖垮 sidecar 启动。
+    int? cfRelayPort;
+    File? cfTrustStore;
+    try {
+      final MihonCfCertManager cfCertManager = MihonCfCertManager(dataDirectory);
+      final MihonCfFetchProxy cfFetchProxy = MihonCfFetchProxy(
+        certManager: cfCertManager,
+        fetcher: WebView2CfFetcher(),
+      );
+      cfRelayPort = await cfFetchProxy.start();
+      _cfFetchProxy = cfFetchProxy;
+      _cfCertManager = cfCertManager;
+      // 合并信任库：runtime 自带 cacerts + 内置 CA（keytool 合成 PKCS12，145 条）。
+      // 实测：-Djavax.net.ssl.trustStore 替换默认库后，既信我们 CA（代发 mycomic）
+      // 又保住系统根证书（sidecar 访问其它漫画源不崩），双目标均通过。
+      cfTrustStore = await cfCertManager.materializeMergedTrustStore(
+        keytool: _keytoolPath(),
+        runtimeCacerts: _runtimeCacertsPath(),
+      );
+    } on Object {
+      cfRelayPort = null;
+      cfTrustStore = null;
+    }
+    // 信任库没生成 → 关掉 relay：无信任库的代发会让 JVM 拒连、徒增 502，不如不启用。
+    if (cfTrustStore == null) {
+      try {
+        await _cfFetchProxy?.stop();
+      } on Object {
+        // ignore
+      }
+      _cfFetchProxy = null;
+      _cfCertManager = null;
+      cfRelayPort = null;
+    }
+
+    final MihonProxyPolicyServer proxyPolicy = await MihonProxyPolicyServer.start(
+      token,
+      cfFetchProxyPort: cfRelayPort,
+    );
     _proxyPolicy = proxyPolicy;
     final Process process = await Process.start(
       java.path,
@@ -490,6 +558,12 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
         '-Xmx512m',
         '-Djava.awt.headless=true',
         '-Djava.util.prefs.userRoot=${preferences.path}',
+        if (cfTrustStore != null)
+          ...<String>[
+            '-Djavax.net.ssl.trustStore=${cfTrustStore!.path}',
+            '-Djavax.net.ssl.trustStoreType=PKCS12',
+            '-Djavax.net.ssl.trustStorePassword=changeit',
+          ],
         '-jar',
         server.path,
         // 0 = "bind an ephemeral port yourself and tell us which one".
@@ -838,6 +912,39 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
       runtimeName,
       'bin',
       Platform.isWindows ? 'java.exe' : 'java',
+    );
+  }
+
+  /// 合并 CF 信任库要用的 keytool（Fushi 自带 runtime 的 `bin/keytool(.exe)`）。
+  /// 与 [_javaExecutablePath] 同布局。缺失时 `materializeMergedTrustStore` 返回
+  /// null → 代发降级到现状（不连累启动）。
+  File _keytoolPath() {
+    final String runtimeName =
+        Platform.isMacOS ? 'runtime-macos-arm64' : 'runtime';
+    return File(
+      p.join(
+        resourceDirectory.path,
+        runtimeName,
+        'bin',
+        Platform.isWindows ? 'keytool.exe' : 'keytool',
+      ),
+    );
+  }
+
+  /// JVM 自带根证书库（`lib/security/cacerts`）。合并它（而非系统 ca-bundle）
+  /// 才能保证与 Fushi 内置 JVM 实际信任的根证书集合一致——这是「替换 trustStore
+  /// 不破坏 sidecar 访问其它源」的前提。
+  File _runtimeCacertsPath() {
+    final String runtimeName =
+        Platform.isMacOS ? 'runtime-macos-arm64' : 'runtime';
+    return File(
+      p.join(
+        resourceDirectory.path,
+        runtimeName,
+        'lib',
+        'security',
+        'cacerts',
+      ),
     );
   }
 
