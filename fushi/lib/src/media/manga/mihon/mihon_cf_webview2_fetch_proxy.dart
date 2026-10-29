@@ -207,7 +207,7 @@ final class MihonCfFetchProxy {
         break; // 头行读完即止
       }
       if (method == null || target == null) {
-        unawaited(conn.destroy());
+        conn.destroy();
         return;
       }
       final Uri url =

@@ -22,7 +22,7 @@ import 'package:fushi/src/media/manga/mihon/mihon_cf_delegation.dart';
 /// 之所以是抽象而非写死：代取代理（纯 dart:io）与取数（需 Flutter 引擎/WebView2）解耦，
 /// 代理协议层可脱离 WebView 单独对拍验证；取数失败/未就绪时切换实现而非让整条
 /// 链路崩掉。
-abstract final class MihonCfFetcher {
+abstract class MihonCfFetcher {
   /// 取 [url]；[resource] 决定取 HTML 还是二进制图片。
   ///
   /// 返回 [CfFetchResult.failed] 时，代取代理应**放弃这次代发、让 JVM 走原路**
@@ -40,6 +40,7 @@ final class CfFetchResult {
     required this.contentType,
     this.status = 200,
     this.additionalHeaders = const <String, String>{},
+    this.error = '',
   });
 
   const CfFetchResult.failed({required this.error})
@@ -266,7 +267,7 @@ class DartHttpCfFetcher extends MihonCfFetcher {
         return CfFetchResult.failed(error: 'http $status');
       }
       final dynamic bytes = resp.bodyBytes;
-      final String ct = (resp.headers?.['content-type'] ?? '').toString();
+      final String ct = (resp.headers?['content-type'] ?? '').toString();
       return CfFetchResult.success(
         body: bytes as List<int>,
         contentType: ct,
