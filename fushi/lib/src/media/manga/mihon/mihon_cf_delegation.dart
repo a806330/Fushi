@@ -1,5 +1,15 @@
 import 'package:fushi/src/media/manga/mihon/mihon_models.dart';
 
+/// 资源类型：决定代取代理怎么「回填」一个被委托的请求。
+///
+/// - [page]：列表 / 详情 / 搜索等，响应体是 HTML/JSON。代取代理用 WebView2 导航到
+///   该 URL、`evaluateJavascript` 取 `document.documentElement.outerHTML` 原样回填，
+///   扩展侧的 Kotlin 解析（正则 chapters / div[data-flux-card]…）一字不动。
+/// - [image]：章节页图片等二进制。代取代理在 WebView2 里 `fetch(url).arrayBuffer()`
+///   转 base64 取回，宿主再 decode 成字节回填。Chromium 的 fetch 也是浏览器指纹，
+///   能过 CF 拿图。
+enum CfResource { page, image }
+
 /// Cloudflare「浏览器代发」宿主侧的 host 名单与资源类型判定。
 ///
 /// 背景（见 docs `MyComic_WebView2代发_实现蓝图.md`）：CF 保护的漫画源（MyComic 等）
@@ -17,16 +27,6 @@ import 'package:fushi/src/media/manga/mihon/mihon_models.dart';
 /// `mihonLoginTarget` 同一范式：判据一旦悄悄恒假，表现就是按钮/路由从此不出现）。
 class MihonCfDelegation {
   MihonCfDelegation._();
-
-  /// 资源类型：决定代取代理怎么「回填」一个被委托的请求。
-  ///
-  /// - [page]：列表 / 详情 / 搜索等，响应体是 HTML/JSON。代取代理用 WebView2 导航到
-  ///   该 URL、`evaluateJavascript` 取 `document.documentElement.outerHTML` 原样回填，
-  ///   扩展侧的 Kotlin 解析（正则 chapters / div[data-flux-card]…）一字不动。
-  /// - [image]：章节页图片等二进制。代取代理在 WebView2 里 `fetch(url).arrayBuffer()`
-  ///   转 base64 取回，宿主再 decode 成字节回填。Chromium 的 fetch 也是浏览器指纹，
-  ///   能过 CF 拿图。
-  enum CfResource { page, image }
 
   /// host → 资源类型 的登记表（**全小写**、去末尾点）。新增一个 CF 源就加一行。
   ///

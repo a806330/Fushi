@@ -24,7 +24,7 @@ final class MihonCfCertManager {
   /// 「runtime 自带 cacerts + 本 CA」合成一个 PKCS12，用 `-Djavax.net.ssl.trustStore`
   /// **替换**默认信任库（144 系统根 + 1 CA，双目标实测 local+public 均通过，不破坏
   /// sidecar 访问其它漫画源）。
-  static const String caPem => MihonCfBuiltInCerts.caPem;
+  static const String caPem = MihonCfBuiltInCerts.caPem;
 
   /// CF host 的叶子证书（host -> [certPem, keyPem]）。
   static Map<String, List<String>> get leafMap => MihonCfBuiltInCerts.leaves;

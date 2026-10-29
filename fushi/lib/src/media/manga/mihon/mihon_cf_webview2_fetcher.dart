@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
@@ -114,7 +115,7 @@ class WebView2CfFetcher extends MihonCfFetcher {
     }
     try {
       // loadUrl 是签名 `loadUrl({required URLRequest urlRequest, ...})`。
-      await c.loadUrl(urlRequest: URLRequest(url: WebUri.uri(url.toString())));
+      await c.loadUrl(urlRequest: URLRequest(url: WebUri.uri(url)));
       // 等 CF 5 秒盾 / 首帧渲染 + JS 就位。
       await Future<void>.delayed(_loadSettle);
       return resource == CfResource.image

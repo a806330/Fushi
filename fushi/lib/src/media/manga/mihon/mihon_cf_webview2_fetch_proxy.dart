@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:fushi/src/media/manga/mihon/mihon_cf_cert_manager.dart';
 import 'package:fushi/src/media/manga/mihon/mihon_cf_delegation.dart';
