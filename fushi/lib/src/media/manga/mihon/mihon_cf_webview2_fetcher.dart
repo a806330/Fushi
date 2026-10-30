@@ -175,17 +175,36 @@ class WebView2CfFetcher extends MihonCfFetcher {
   }
 
   Future<CfFetchResult> _fetchPage(InAppWebViewController c) async {
-    const String js =
+    // 轮询等待 DOM 真正可用，而不是死等固定 settle：
+    // 实测同一站点「列表页」3s 内就绪、「详情页」3s 时还是 loading，
+    // 旧实现在后者上取到空串 → 回填 0 字节 → 扩展侧 NPE。
+    const String stateJs = 'document.readyState';
+    const String htmlJs =
         '(function(){try{'
-        'return document.readyState==="loading"?""'
-        ':document.documentElement ? document.documentElement.outerHTML : "";'
+        'return document.documentElement ? document.documentElement.outerHTML : "";'
         '}catch(e){return "";}})()';
-    // evaluateJavascript 签名：`evaluateJavascript({required String source, ContentWorld? contentWorld})`。
-    final Object? html = await c.evaluateJavascript(source: js);
-    return CfFetchResult.page(
-      (html?.toString() ?? '').trim(),
-      'text/html; charset=utf-8',
-    );
+    String html = '';
+    for (int i = 0; i < 24; i++) {
+      Object? state;
+      try {
+        state = await c.evaluateJavascript(source: stateJs);
+      } on Object {
+        state = null;
+      }
+      final String s = state?.toString() ?? '';
+      if (s == 'complete' || s == 'interactive') {
+        final Object? v = await c.evaluateJavascript(source: htmlJs);
+        html = (v?.toString() ?? '').trim();
+        if (html.isNotEmpty) break;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+    }
+    if (html.isEmpty) {
+      // 取不到就明确失败（上层回 502 让 JVM 重试），绝不伪装成「取到了空页」。
+      debugLogMihonCf('page DOM stayed empty after wait');
+      return CfFetchResult.failed(error: 'page DOM empty after wait');
+    }
+    return CfFetchResult.page(html, 'text/html; charset=utf-8');
   }
 
   Future<CfFetchResult> _fetchImage(InAppWebViewController c, Uri url) async {
