@@ -52,7 +52,7 @@ jobs:
           unzip -q artifact.zip -d artifact-download
           du -sh artifact-download
           echo "top level:"
-          ls -la artifact-download | head -20
+          find artifact-download -maxdepth 1 -mindepth 1 -printf '%y %10s %p\n'
 
       - name: Split into volumes and push to orphan branch
         env:
