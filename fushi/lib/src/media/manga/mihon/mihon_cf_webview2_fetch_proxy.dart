@@ -78,9 +78,12 @@ final class MihonCfFetchProxy {
         continue; // 无内置证书：该 host 不代发
       }
       try {
+        // 注意：useCertificateChain/usePrivateKey 接受的是**文件路径**；我们的证书是
+        // 内联 PEM 字符串，必须用 *Bytes 变体，否则会被当路径打开并抛
+        // PathNotFoundException（表现为 TLS 端点静默起不来）。
         final SecurityContext ctx = SecurityContext()
-          ..useCertificateChain(material[0])
-          ..usePrivateKey(material[1]);
+          ..useCertificateChainBytes(utf8.encode(material[0]))
+          ..usePrivateKeyBytes(utf8.encode(material[1]));
         final SecureServerSocket tlsSock = await SecureServerSocket.bind(
           InternetAddress.loopbackIPv4,
           0,
