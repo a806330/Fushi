@@ -1,0 +1,45 @@
+name: Push build artifact to branch (codeload-friendly)
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Source workflow run id that produced the artifact'
+        required: true
+        default: '40897693045'
+      artifact_name:
+        description: 'Artifact name to re-host'
+        required: true
+        default: 'win-x64-fushi-debug-bundle'
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact from existing run
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          run-id: ${{ inputs.run_id }}
+          path: artifact-download
+
+      - name: List what we got
+        run: |
+          echo "downloaded artifact contents:"
+          ls -la artifact-download | head -40
+          du -sh artifact-download
+
+      - name: Push artifact to orphan branch (codeload-friendly)
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd artifact-download
+          git init -b build-artifacts-win
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add -A
+          git commit -m "win-x64-fushi-debug-bundle from run ${{ inputs.run_id }}"
+          git remote add origin "https://x-access-token:${TOKEN}@github.com/a806330/Fushi.git"
+          git push origin build-artifacts-win --force
+          echo "PUSHED build-artifacts-win"
