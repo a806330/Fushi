@@ -47,7 +47,11 @@ final class MihonCfFetchProxy {
   final RegExp _connectRe = RegExp(r'^CONNECT\s+(\S+)\s+HTTP/[\d.]+');
   final RegExp _reqLineRe =
       RegExp(r'^(GET|POST|PUT|HEAD|DELETE)\s+(\S+)\s+HTTP/[\d.]+');
-  final RegExp _hostRe = RegExp(r'(?i)^Host:\s*([^\r\n]+)');
+  // 注意：这里曾有一个 `RegExp(r'(?i)^Host:...')` 字段。Dart 的正则走 ECMAScript
+  // 语法，不支持 `(?i)` 内联标志，该字段在**对象构造时**就抛
+  // `FormatException: Invalid group`，导致整个 MihonCfFetchProxy 构造失败、CF 代发
+  // 从未启用（且被上层 catch 静默吞掉）。该字段本来就没人用，已移除；
+  // 将来若要按 Host 头匹配，请用 `RegExp(r'^Host:\s*(\S+)', caseSensitive: false)`。
 
   ServerSocket? _relay;
   final List<SecureServerSocket> _tlsSockets = <SecureServerSocket>[];
