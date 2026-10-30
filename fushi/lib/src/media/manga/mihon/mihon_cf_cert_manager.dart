@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 
 import 'package:fushi/src/media/manga/mihon/mihon_cf_builtin_certs.dart';
@@ -63,8 +64,14 @@ final class MihonCfCertManager {
         File(p.join(dataDirectory.path, 'mihon', 'cf_truststore.p12'));
     try {
       dest.parent.createSync(recursive: true);
-      if (dest.existsSync()) return dest;
+      if (dest.existsSync()) {
+        debugPrint('[Fushi][mihon-cf] trustStore reuse existing: ${dest.path}');
+        return dest;
+      }
       if (!keytool.existsSync() || !runtimeCacerts.existsSync()) {
+        debugPrint('[Fushi][mihon-cf] trustStore prerequisites missing: '
+            'keytool=${keytool.existsSync()}(${keytool.path}) '
+            'cacerts=${runtimeCacerts.existsSync()}(${runtimeCacerts.path})');
         return null;
       }
       // 内置 CA 的 PEM 落盘（keytool 只能读文件，不能从内存 importcert）。
@@ -88,6 +95,8 @@ final class MihonCfCertManager {
         ],
       );
       if (step1.exitCode != 0) {
+        debugPrint('[Fushi][mihon-cf] keytool importkeystore(PKCS12) '
+            'exit=${step1.exitCode} stderr=${step1.stderr}');
         // PKCS12 读不了源就试 JKS（老 runtime）。
         final ProcessResult step1jks = await Process.run(
           keytool.path,
@@ -128,10 +137,14 @@ final class MihonCfCertManager {
         ],
       );
       if (step2.exitCode != 0) {
+        debugPrint('[Fushi][mihon-cf] keytool importcert(CA) '
+            'exit=${step2.exitCode} stderr=${step2.stderr}');
         return null;
       }
       return dest;
-    } on Object {
+    } on Object catch (error, stack) {
+      debugPrint('[Fushi][mihon-cf] trustStore materialize FAILED: '
+          '$error\n$stack');
       return null;
     }
   }
