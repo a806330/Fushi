@@ -63,9 +63,16 @@ final class MihonCfFetchProxy {
   /// 让 ③ 的路由有稳定端口可指（行为=现状，不更坏）。
   Future<int> start() async {
     if (_relayPort != 0) return _relayPort;
+    debugLogMihonCf(
+      'start: probing ${MihonCfDelegation.cfHosts.length} CF host(s) '
+      '${MihonCfDelegation.cfHosts.join(",")}',
+    );
     for (final String host in MihonCfDelegation.cfHosts) {
       final List<String>? material = certManager.leafMaterialFor(host);
-      if (material == null) continue; // 无内置证书：该 host 不代发
+      if (material == null) {
+        debugLogMihonCf('start: no built-in leaf material for $host (skipped)');
+        continue; // 无内置证书：该 host 不代发
+      }
       try {
         final SecurityContext ctx = SecurityContext()
           ..useCertificateChain(material[0])
@@ -77,16 +84,24 @@ final class MihonCfFetchProxy {
         );
         _tlsSockets.add(tlsSock);
         _hostPort[host] = tlsSock.port;
+        debugLogMihonCf('start: TLS endpoint ready for $host:${tlsSock.port}');
         tlsSock.listen(
           (SecureSocket conn) => unawaited(_serveHost(conn, host)),
           onError: (Object _) {},
         );
-      } on Object {
-        // 单个 host 的 TLS 端点起不来：跳过它（继续代发其它 host），不连累整体。
+      } on Object catch (e, st) {
+        debugLogMihonCf('start: TLS endpoint for $host FAILED: $e\n$st');
       }
     }
-    _relay = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    try {
+      _relay = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    } on Object catch (e, st) {
+      debugLogMihonCf('start: relay bind FAILED: $e\n$st');
+      rethrow;
+    }
     _relayPort = _relay!.port;
+    debugLogMihonCf('start: relay listening on 127.0.0.1:$_relayPort '
+        '(tls ports: $_hostPort)');
     _relay!.listen(
       (Socket sock) => unawaited(_bridge(sock)),
       onError: (Object _) {},
