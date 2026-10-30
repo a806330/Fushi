@@ -5,7 +5,7 @@ on:
       run_id:
         description: 'Source workflow run id that produced the artifact'
         required: true
-        default: '40897693045'
+        default: '41094115374'
       artifact_name:
         description: 'Artifact name to re-host'
         required: true
@@ -14,6 +14,10 @@ on:
         description: 'Artifact id (used to skip name lookup)'
         required: true
         default: '12910168969'
+      mode:
+        description: 'kernel_blob = only Dart artifact + manifest (small/fast); full = whole bundle'
+        required: true
+        default: 'kernel_blob'
 
 jobs:
   push:
@@ -54,21 +58,35 @@ jobs:
           echo "top level:"
           find artifact-download -maxdepth 1 -mindepth 1 -printf '%y %10s %p\n'
 
-      - name: Split into volumes and push to orphan branch
+      - name: Package and push to orphan branch
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
           cd artifact-download
-          echo "artifact size:"; du -sh .
-          7z a -v50m ../bundle.7z . >/dev/null
+
+          # 全量清单：即使只替换 kernel_blob，也能核对其余文件是否与本地一致
+          find . -type f -printf '%s\t%p\n' | sort -k2 > ../manifest.txt
+          echo "--- kernel_blob ---"
+          sha256sum data/flutter_assets/kernel_blob.bin 2>/dev/null >> ../manifest.txt || true
+          stat -c 'kernel_blob_bytes=%s' data/flutter_assets/kernel_blob.bin 2>/dev/null || true
+
+          if [ "$MODE" = "kernel_blob" ]; then
+            echo "packing kernel_blob only"
+            7z a -v50m ../bundle.7z data/flutter_assets/kernel_blob.bin ../manifest.txt >/dev/null
+          else
+            echo "packing full bundle"
+            7z a -v50m ../bundle.7z . >/dev/null
+          fi
+
           cd ..
           echo "volumes:"; ls -la bundle.7z.*
           git init -b build-artifacts-win
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
           git add -f bundle.7z.*
-          git commit -m "win-x64-fushi-debug-bundle split volumes (run ${{ inputs.run_id }})"
+          git commit -m "re-host (${{ inputs.mode }}) from run ${{ inputs.run_id }}"
           git remote add origin "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git"
           git push origin build-artifacts-win --force
           echo PUSHED build-artifacts-win
