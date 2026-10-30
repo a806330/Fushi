@@ -1,0 +1,48 @@
+name: Push build artifact to branch (split volumes, codeload-friendly)
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Source workflow run id that produced the artifact'
+        required: true
+        default: '40897693045'
+      artifact_name:
+        description: 'Artifact name to re-host'
+        required: true
+        default: 'win-x64-fushi-debug-bundle'
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Install p7zip
+        run: sudo apt-get update && sudo apt-get install -y p7zip-full
+
+      - name: Download artifact from existing run
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          run-id: ${{ inputs.run_id }}
+          path: artifact-download
+
+      - name: Split into <100MB volumes and push to orphan branch
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd artifact-download
+          echo "artifact size:"; du -sh .
+          # 分卷压缩成 7z 分卷，每卷 50MB（绕开 GitHub 单文件 100MB 推送限制）
+          7z a -v50m ../bundle.7z . >/dev/null
+          cd ..
+          echo "volumes:"; ls -la bundle.7z.*
+          git init -b build-artifacts-win
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add -f bundle.7z.*
+          git commit -m "win-x64-fushi-debug-bundle split volumes (run ${{ inputs.run_id }})"
+          git remote add origin "https://x-access-token:${TOKEN}@github.com/a806330/Fushi.git"
+          git push origin build-artifacts-win --force
+          echo PUSHED build-artifacts-win
