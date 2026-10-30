@@ -524,6 +524,7 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
       cfRelayPort = await cfFetchProxy.start();
       _cfFetchProxy = cfFetchProxy;
       _cfCertManager = cfCertManager;
+      debugPrint('[Fushi][mihon-cf] relay started on port $cfRelayPort');
       // 合并信任库：runtime 自带 cacerts + 内置 CA（keytool 合成 PKCS12，145 条）。
       // 实测：-Djavax.net.ssl.trustStore 替换默认库后，既信我们 CA（代发 mycomic）
       // 又保住系统根证书（sidecar 访问其它漫画源不崩），双目标均通过。
@@ -531,7 +532,10 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
         keytool: _keytoolPath(),
         runtimeCacerts: _runtimeCacertsPath(),
       );
-    } on Object {
+      debugPrint('[Fushi][mihon-cf] trustStore = ${cfTrustStore?.path ?? "NULL"} '
+          '(keytool=${_keytoolPath().path}, cacerts=${_runtimeCacertsPath().path})');
+    } on Object catch (error, stack) {
+      debugPrint('[Fushi][mihon-cf] delegation init FAILED: $error\n$stack');
       cfRelayPort = null;
       cfTrustStore = null;
     }
