@@ -10,6 +10,10 @@ on:
         description: 'Artifact name to re-host'
         required: true
         default: 'win-x64-fushi-debug-bundle'
+      artifact_id:
+        description: 'Artifact id (used to skip name lookup)'
+        required: true
+        default: '12910168969'
 
 jobs:
   push:
@@ -21,20 +25,42 @@ jobs:
       - name: Install p7zip
         run: sudo apt-get update && sudo apt-get install -y p7zip-full
 
-      - name: Download artifact from existing run
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ inputs.artifact_name }}
-          run-id: ${{ inputs.run_id }}
-          path: artifact-download
+      - name: Download artifact via REST API
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifact-download
 
-      - name: Split into <100MB volumes and push to orphan branch
+          echo "===== diagnose: can this token list run artifacts? ====="
+          curl -s -o /tmp/list.json -w "list HTTP %{http_code}\n" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ inputs.run_id }}/artifacts?name=${{ inputs.artifact_name }}" || true
+          head -c 800 /tmp/list.json || true
+          echo
+
+          echo "===== download artifact zip by id ====="
+          curl -sS -L --retry 3 --retry-delay 5 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/${{ inputs.artifact_id }}/zip" \
+            -o artifact.zip -w "download HTTP %{http_code} size=%{size_download}\n"
+
+          ls -la artifact.zip
+          echo "===== unzip ====="
+          unzip -q artifact.zip -d artifact-download
+          du -sh artifact-download
+          echo "top level:"
+          ls -la artifact-download | head -20
+
+      - name: Split into volumes and push to orphan branch
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           cd artifact-download
           echo "artifact size:"; du -sh .
-          # 分卷压缩成 7z 分卷，每卷 50MB（绕开 GitHub 单文件 100MB 推送限制）
           7z a -v50m ../bundle.7z . >/dev/null
           cd ..
           echo "volumes:"; ls -la bundle.7z.*
@@ -43,6 +69,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git add -f bundle.7z.*
           git commit -m "win-x64-fushi-debug-bundle split volumes (run ${{ inputs.run_id }})"
-          git remote add origin "https://x-access-token:${TOKEN}@github.com/a806330/Fushi.git"
+          git remote add origin "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git"
           git push origin build-artifacts-win --force
           echo PUSHED build-artifacts-win
