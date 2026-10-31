@@ -273,32 +273,62 @@ class WebView2CfFetcher extends MihonCfFetcher {
   Future<CfFetchResult> _fetchImage(InAppWebViewController c, Uri url) async {
     // 先导航到同域（携带 cf_clearance），再在页内 fetch 图片 → arrayBuffer → base64。
     // WebView2 内部 fetch 用浏览器指纹发请求，也能过 CF。
-    const String jsTpl = '''
-      (async function(){
+    //
+    // 重要：不能用「evaluateJavascript(async IIFE) 直接拿返回值」——WebView2 的
+    // ExecuteScript **不等待 Promise**，未完成的 Promise 会被序列化成 "{}"（实测
+    // 全部图片 status=n/a 的根因）。这里改成：JS 侧发起 fetch 并把结果写到
+    // window.__imgResult，Dart 侧轮询取回 —— 全程同步求值，绕开 Promise 序列化。
+    final String u = jsonEncode(url.toString());
+    final Object? started = await c.evaluateJavascript(source: '''
+      (function(){
         try {
-          const r = await fetch("%URL%", {credentials: 'include'});
-          if (!r.ok) return JSON.stringify({ok:false,status:r.status});
-          const b = await r.arrayBuffer();
-          const by = new Uint8Array(b);
-          let bin='';
-          for (let i=0;i<by.length;i++) bin+=String.fromCharCode(by[i]);
-          return JSON.stringify({ok:true,ct:r.headers.get('content-type')||'',b64:btoa(bin)});
-        } catch (e) { return JSON.stringify({ok:false,err:String(e)}); }
+          window.__imgResult = null;
+          fetch($u, {credentials: 'include'}).then(async function(r){
+            if (!r.ok) { window.__imgResult = {ok:false, status:r.status}; return; }
+            const b = await r.arrayBuffer();
+            const by = new Uint8Array(b);
+            let bin = '';
+            const CHUNK = 0x8000;
+            for (let i = 0; i < by.length; i += CHUNK) {
+              bin += String.fromCharCode.apply(null, by.subarray(i, i + CHUNK));
+            }
+            window.__imgResult = {ok:true, ct:r.headers.get('content-type')||'', b64:btoa(bin)};
+          }).catch(function(e){ window.__imgResult = {ok:false, err:String(e)}; });
+          return 'started';
+        } catch (e) { return 'throw:' + String(e); }
       })()
-    ''';
-    final String js = jsTpl.replaceAll('%URL%', url.toString().replaceAll('"', r'\"'));
-    final Object? raw = await c.evaluateJavascript(source: js);
-    final String s = raw?.toString() ?? '';
-    if (raw == null || s.isEmpty) {
-      debugLogMihonCf('image: evaluateJavascript returned null/empty for $url');
+    ''');
+    final String startedS = started?.toString() ?? '';
+    if (startedS != 'started') {
+      debugLogMihonCf('image: kick-off failed for $url: $startedS');
+      return CfFetchResult.failed(error: 'image kick-off failed: $startedS');
     }
     final Map<String, Object?> m;
-    try {
-      m = jsonDecode(s.isEmpty ? '{}' : s) as Map<String, Object?>;
-    } on FormatException {
-      debugLogMihonCf('image: non-JSON for $url: ${s.length > 200 ? s.substring(0, 200) : s}');
-      return CfFetchResult.failed(error: 'image fetch returned non-JSON: $s');
+    // 轮询结果（fetch 图片通常 1-3 秒；给足 40s，仍在 kFetchTimeout 内）。
+    Object? picked;
+    for (int i = 0; i < 130; i++) {
+      final Object? v = await c.evaluateJavascript(
+        source: r'window.__imgResult === null ? null : JSON.stringify(window.__imgResult)',
+      );
+      final String s = v?.toString() ?? '';
+      if (s.isNotEmpty && s != 'null') {
+        picked = s;
+        break;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 300));
     }
+    if (picked == null) {
+      debugLogMihonCf('image: result never arrived within 39s for $url');
+      return CfFetchResult.failed(error: 'image result timeout');
+    }
+    final Map<String, Object?> parsed;
+    try {
+      parsed = jsonDecode(picked.toString()) as Map<String, Object?>;
+    } on FormatException {
+      debugLogMihonCf('image: non-JSON result for $url');
+      return CfFetchResult.failed(error: 'image result non-JSON');
+    }
+    m = parsed;
     if (m['ok'] != true) {
       debugLogMihonCf(
         'image: fetch failed for $url: status=${m['status'] ?? m['err'] ?? 'n/a'}',
