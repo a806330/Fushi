@@ -31,16 +31,18 @@ class MihonCfDelegation {
   /// host → 资源类型 的登记表（**全小写**、去末尾点）。新增一个 CF 源就加一行。
   ///
   /// MyComic（Mihon 扩展 `eu.kanade.tachiyomi.extension.zh.mycomic`）：
-  /// - `mycomic.com`：Laravel/Livewire 页面，章节目录藏在 `application/ld+json` 与
-  ///   Alpine `x-data` 的 `chapters:` 数组里 → [CfResource.page]。
-  /// - `biccam.com`：MyComic 的封面/章节图 CDN（`biccam.com/comics/…`、`/chapters/…`）
-  ///   → [CfResource.image]。
+  /// - `mycomic.com`：Laravel/Livewire 页面，被 CF 拦（TLS 指纹）→ [CfResource.page]。
   ///
-  /// 先收录这两类；任何**未登记** host 一律不当 CF 源处理（走原路），宁缺毋滥——
+  /// ** biccam.com（封面/章节图床）刻意不在名单内**：实测它对请求只做 Referer
+  /// 防盗链（WebView2 图片页内 fetch 的 Referer 是 biccam 自身 → 403；而
+  /// OkHttp 直连一直正常），并不是 CF 指纹墙。把它放进代发不仅每张图都
+  /// 403，还会让列表/详情的几十个封面全部挤进 WebView2 串行队列（8s 级
+  /// 单次导航），是「全源都慢」的主因。图片请求交给 OkHttp 原路即可。
+  ///
+  /// 先收录这一类；任何**未登记** host 一律不当 CF 源处理（走原路），宁缺毋滥——
   /// 把一个不被 CF 拦的 host 误送进代发只会平白加延迟、还可能把它也拖进 403 循环。
   static final Map<String, CfResource> _cfHosts = <String, CfResource>{
     'mycomic.com': CfResource.page,
-    'biccam.com': CfResource.image,
   };
 
   /// host 归一：小写、去末尾 `.`。与 [MihonCookie.canonicalizeDomain] 同一口径，避免
