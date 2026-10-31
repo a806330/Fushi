@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
@@ -90,7 +89,6 @@ class WebView2CfFetcher extends MihonCfFetcher {
   /// 每个 fetch 之间的 settle 时间：给 CF 5 秒盾 + 首帧渲染留足。
   /// 已带 cf_clearance 的场景（用户之前过验证）实际 1s 内就够；留 3s 覆盖
   /// 首次请求。图片 fetch 是页内 fetch，无额外 settle 需求。
-  static const Duration _loadSettle = Duration(seconds: 3);
 
   /// 拿到 [InAppWebViewController] 前的最大等待（40 × 250ms = 10s 起步，WebView2
   /// 冷启动一般 < 2s）。
@@ -118,19 +116,12 @@ class WebView2CfFetcher extends MihonCfFetcher {
     try {
       // loadUrl 是签名 `loadUrl({required URLRequest urlRequest, ...})`。
       await c.loadUrl(urlRequest: URLRequest(url: WebUri.uri(url)));
-      // 轮询等页面就绪，替代原先固定 3 秒：页面快时几乎立刻返回，
-      // 慢时最多等上限。这条路径对每个代发请求都会走一次，
-      // 固定等待是「所有源都慢」的主因。
-      // 图片走 biccam 图床，首航导航比主站慢，给更长上限。
-      await _waitForDomReady(
-        c,
-        maxWait: resource == CfResource.image
-            ? const Duration(seconds: 8)
-            : _loadSettle,
-      );
+      // 轮询等 DOM 可解析（interactive），而非 complete——complete 要等图片等
+      // 全部子资源下完，对「取 outerHTML」毫无必要，白等数秒。
+      await _waitForDomReady(c, maxWait: const Duration(seconds: 6));
       return resource == CfResource.image
           ? await _fetchImage(c, url)
-          : await _fetchPage(c);
+          : await _fetchPage(c, url);
     } on Object catch (e, st) {
       // 取数失败一律降级：调用方退回原路（=现状）。绝不崩 app。
       debugLogMihonCf('fetch error for $url: $e\n$st');
@@ -138,24 +129,23 @@ class WebView2CfFetcher extends MihonCfFetcher {
     }
   }
 
-  /// 轮询 `document.readyState` 直到 `complete`，最多 [maxWait]。
-  ///
-  /// 之所以不用固定 delay：固定 3 秒会让**每一次**代发请求都白等 3 秒；
-  /// 而页面实际就绪时间差异很大（列表页 ~1s，章节页可能 5s+）。
+  /// 轮询 `document.readyState` 到 interactive（DOM 解析完成，可安全取
+  /// outerHTML）即返回；超过 [maxWait] 放弃等待直接尝试取。
   Future<void> _waitForDomReady(
     InAppWebViewController c, {
     required Duration maxWait,
   }) async {
-    final int steps = maxWait.inMilliseconds ~/ 250;
+    final int steps = maxWait.inMilliseconds ~/ 200;
     for (int i = 0; i < steps; i++) {
       try {
         final Object? state =
             await c.evaluateJavascript(source: 'document.readyState');
-        if ((state?.toString() ?? '') == 'complete') return;
+        final String v = state?.toString() ?? '';
+        if (v == 'interactive' || v == 'complete') return;
       } on Object {
         // 导航过程中 evaluate 可能抛，继续等
       }
-      await Future<void>.delayed(const Duration(milliseconds: 250));
+      await Future<void>.delayed(const Duration(milliseconds: 200));
     }
   }
 
@@ -204,67 +194,38 @@ class WebView2CfFetcher extends MihonCfFetcher {
     return null;
   }
 
-  Future<CfFetchResult> _fetchPage(InAppWebViewController c) async {
-    // 章节页的图片是 Alpine `x-intersect` 懒加载：不把页面滚到底，部分 <img>
-    // 不会进入已渲染状态（data-src/src 为空），扩展的 `img[x-ref]` 解析就会拿到
-    // 空清单 → 阅读器显示「本章尚未下载」。这里滚到底触发一轮再取 DOM。
-    try {
-      await c.evaluateJavascript(source: '''
-        (function(){try{
-          var h = document.body ? document.body.scrollHeight : 0;
-          window.scrollTo(0, h);
-          return String(h);
-        }catch(e){return "0";}})()
-      ''');
-      await Future<void>.delayed(const Duration(milliseconds: 600));
-    } on Object {
-      // 滚动失败不影响后续取 HTML
+  Future<CfFetchResult> _fetchPage(InAppWebViewController c, Uri url) async {
+    // 只有章节阅读页需要滚动触发 Alpine `x-intersect` 懒加载（否则 img[x-ref]
+    // 的地址不填充，扩展解析出空清单）；列表/详情不滚，省 300ms。
+    if (url.path.contains('/chapters/')) {
+      try {
+        await c.evaluateJavascript(
+          source:
+              'window.scrollTo(0, document.body ? document.body.scrollHeight : 0)',
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+      } on Object {
+        // 滚动失败不影响取 HTML
+      }
     }
 
-    // 轮询等待 DOM 真正可用，而不是死等固定 settle：
-    // 实测同一站点「列表页」3s 内就绪、「详情页」3s 时还是 loading，
-    // 旧实现在后者上取到空串 → 回填 0 字节 → 扩展侧 NPE。
-    const String stateJs = 'document.readyState';
     const String htmlJs =
         '(function(){try{'
         'return document.documentElement ? document.documentElement.outerHTML : "";'
         '}catch(e){return "";}})()';
     String html = '';
-    for (int i = 0; i < 24; i++) {
-      Object? state;
-      try {
-        state = await c.evaluateJavascript(source: stateJs);
-      } on Object {
-        state = null;
-      }
-      final String s = state?.toString() ?? '';
-      if (s == 'complete' || s == 'interactive') {
-        final Object? v = await c.evaluateJavascript(source: htmlJs);
-        html = (v?.toString() ?? '').trim();
-        if (html.isNotEmpty) break;
-      }
-      await Future<void>.delayed(const Duration(milliseconds: 500));
-    }
-
-    // 诊断：把最后一次页面 HTML 落盘，便于核对解析失败是「没元素」还是「属性空」。
-    try {
-      final File dump = File(
-        '${Directory.systemTemp.path}${Platform.pathSeparator}fushi_cf_page_dump.html',
-      );
-      await dump.writeAsString(html);
-      final int imgs = RegExp(r'<img\b').allMatches(html).length;
-      final int xrefs = RegExp(r'x-ref=').allMatches(html).length;
-      final int biccam = RegExp(r'biccam\.com').allMatches(html).length;
-      debugLogMihonCf(
-        'page html len=${html.length} imgs=$imgs xrefs=$xrefs biccam=$biccam -> ${dump.path}',
-      );
-    } on Object catch (e) {
-      debugLogMihonCf('page html len=${html.length} (dump failed: $e)');
+    // _doFetch 已等到 interactive；这里直接取，若为空（个别页 interactive 时
+    // 还没挂 body）再给最多 ~3 秒轮询。
+    for (int i = 0; i < 10; i++) {
+      final Object? v = await c.evaluateJavascript(source: htmlJs);
+      html = (v?.toString() ?? '').trim();
+      if (html.isNotEmpty) break;
+      await Future<void>.delayed(const Duration(milliseconds: 300));
     }
 
     if (html.isEmpty) {
       // 取不到就明确失败（上层回 502 让 JVM 重试），绝不伪装成「取到了空页」。
-      debugLogMihonCf('page DOM stayed empty after wait');
+      debugLogMihonCf('page DOM stayed empty for $url');
       return CfFetchResult.failed(error: 'page DOM empty after wait');
     }
     return CfFetchResult.page(html, 'text/html; charset=utf-8');
