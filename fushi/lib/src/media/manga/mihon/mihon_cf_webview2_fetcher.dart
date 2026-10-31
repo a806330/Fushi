@@ -119,9 +119,15 @@ class WebView2CfFetcher extends MihonCfFetcher {
       // loadUrl 是签名 `loadUrl({required URLRequest urlRequest, ...})`。
       await c.loadUrl(urlRequest: URLRequest(url: WebUri.uri(url)));
       // 轮询等页面就绪，替代原先固定 3 秒：页面快时几乎立刻返回，
-      // 慢时最多等 _loadSettle 上限。这条路径对每个代发请求都会走一次，
+      // 慢时最多等上限。这条路径对每个代发请求都会走一次，
       // 固定等待是「所有源都慢」的主因。
-      await _waitForDomReady(c, maxWait: _loadSettle);
+      // 图片走 biccam 图床，首航导航比主站慢，给更长上限。
+      await _waitForDomReady(
+        c,
+        maxWait: resource == CfResource.image
+            ? const Duration(seconds: 8)
+            : _loadSettle,
+      );
       return resource == CfResource.image
           ? await _fetchImage(c, url)
           : await _fetchPage(c);
@@ -283,13 +289,20 @@ class WebView2CfFetcher extends MihonCfFetcher {
     final String js = jsTpl.replaceAll('%URL%', url.toString().replaceAll('"', r'\"'));
     final Object? raw = await c.evaluateJavascript(source: js);
     final String s = raw?.toString() ?? '';
+    if (raw == null || s.isEmpty) {
+      debugLogMihonCf('image: evaluateJavascript returned null/empty for $url');
+    }
     final Map<String, Object?> m;
     try {
       m = jsonDecode(s.isEmpty ? '{}' : s) as Map<String, Object?>;
     } on FormatException {
+      debugLogMihonCf('image: non-JSON for $url: ${s.length > 200 ? s.substring(0, 200) : s}');
       return CfFetchResult.failed(error: 'image fetch returned non-JSON: $s');
     }
     if (m['ok'] != true) {
+      debugLogMihonCf(
+        'image: fetch failed for $url: status=${m['status'] ?? m['err'] ?? 'n/a'}',
+      );
       return CfFetchResult.failed(
         error: 'image fetch failed: status=${m['status'] ?? m['err'] ?? 'n/a'}',
       );
@@ -299,9 +312,11 @@ class WebView2CfFetcher extends MihonCfFetcher {
     try {
       bytes = base64.decode(b64);
     } on FormatException {
+      debugLogMihonCf('image: base64 decode failed for $url (b64 len=${b64.length})');
       return CfFetchResult.failed(error: 'image base64 decode failed');
     }
     final String ct = m['ct'].toString();
+    debugLogMihonCf('image: OK $url bytes=${bytes.length} ct=$ct');
     return CfFetchResult.image(
       bytes,
       ct.isEmpty ? 'application/octet-stream' : ct,
