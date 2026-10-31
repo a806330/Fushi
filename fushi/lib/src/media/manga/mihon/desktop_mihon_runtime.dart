@@ -92,6 +92,75 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
   final Map<String, http.Client> _imageClients = <String, http.Client>{};
   int _imageRequestSequence = 0;
 
+  // ---- 源图片缓存（内存 LRU + 磁盘）----
+  // 对标 Suwayomi 的 ImageResponse 双缓存：同一张图（翻回上一页 / 重开章节 /
+  // 二次进详情）直接回缓存，不再走 sidecar 下载一整轮。这是 Suwayomi 快而
+  // Fushi 慢的最大单一差异——此前 Fushi 每张图每次都要 1.5~3.7s 重新下载。
+  static const int _kImageMemMaxEntries = 128;
+  final Map<String, Uint8List> _imageMemCache = <String, Uint8List>{};
+  final List<String> _imageMemOrder = <String>[];
+
+  /// 磁盘缓存目录（dataDirectory/mihon/image-cache）。
+  String get _imageCacheDir =>
+      p.join(dataDirectory.path, 'mihon', 'image-cache');
+
+  /// 稳定缓存键：FNV-1a（两个不同种子拼 64 位）+ 原键长度，跨运行稳定且
+  /// 冲突率可忽略；不引入 crypto 依赖。
+  String _imageCacheKey(String key) {
+    int h1 = 0x811c9dc5, h2 = 0x01000193;
+    for (final int code in utf8.encode(key)) {
+      h1 = ((h1 ^ code) * 0x01000193) & 0xFFFFFFFF;
+      h2 = ((h2 ^ code) * 0x00027d4eb2) & 0xFFFFFFFF;
+      h2 ^= h1 & 0xFF;
+    }
+    return '${h1.toRadixString(16).padLeft(8, '0')}'
+        '${h2.toRadixString(16).padLeft(8, '0')}-${key.length}';
+  }
+
+  void _imageMemPut(String key, Uint8List bytes) {
+    if (_imageMemCache.containsKey(key)) {
+      _imageMemOrder.remove(key);
+    } else {
+      while (_imageMemOrder.length >= _kImageMemMaxEntries) {
+        _imageMemCache.remove(_imageMemOrder.removeAt(0));
+      }
+    }
+    _imageMemCache[key] = bytes;
+    _imageMemOrder.add(key);
+  }
+
+  Future<Uint8List?> _readImageCache(String key) async {
+    final Uint8List? mem = _imageMemCache[key];
+    if (mem != null) return mem;
+    try {
+      final File f =
+          File(p.join(_imageCacheDir, '${_imageCacheKey(key)}.img'));
+      if (f.existsSync()) {
+        final Uint8List bytes = await f.readAsBytes();
+        if (bytes.isNotEmpty) {
+          _imageMemPut(key, bytes);
+          return bytes;
+        }
+      }
+    } on Object {
+      // 缓存读不出来当没有
+    }
+    return null;
+  }
+
+  Future<void> _writeImageCache(String key, Uint8List bytes) async {
+    if (bytes.isEmpty) return;
+    _imageMemPut(key, bytes);
+    try {
+      final Directory d = Directory(_imageCacheDir);
+      if (!d.existsSync()) d.createSync(recursive: true);
+      await File(p.join(_imageCacheDir, '${_imageCacheKey(key)}.img'))
+          .writeAsBytes(bytes, flush: false);
+    } on Object {
+      // 磁盘写失败不影响本次返回
+    }
+  }
+
   @visibleForTesting
   int? get processId => _process?.pid;
 
@@ -275,18 +344,23 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     required String requestId,
     List<MihonPreference> preferences = const <MihonPreference>[],
   }) async {
-    await _ensureStarted();
     final Uri requested = Uri.parse(page.resolvedUrl);
     final int? port = _port;
     if (requested.scheme != 'http' ||
         requested.host != '127.0.0.1' ||
-        requested.port != port ||
+        (port != null && requested.port != port) ||
         !requested.path.startsWith('/image/')) {
       throw const MihonRuntimeException(
         'INVALID_IMAGE_URL',
         'Mihon bridge returned an image URL outside its authenticated proxy',
       );
     }
+    // 章节页缓存：键用 path（不含 token 的 query，重启后 token 变但 path 稳定）。
+    // 命中时零网络、且不要求 sidecar 已启动。
+    final String pageKey = 'page:${requested.path}';
+    final Uint8List? cachedPage = await _readImageCache(pageKey);
+    if (cachedPage != null) return cachedPage;
+    await _ensureStarted();
     final http.Client imageClient = http.Client();
     final http.Client? replaced = _imageClients[requestId];
     replaced?.close();
@@ -307,6 +381,7 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
           'Mihon source returned an empty image',
         );
       }
+      unawaited(_writeImageCache(pageKey, response.bodyBytes));
       return response.bodyBytes;
     } finally {
       if (identical(_imageClients[requestId], imageClient)) {
@@ -330,6 +405,10 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     String url, {
     List<MihonPreference> preferences = const <MihonPreference>[],
   }) async {
+    // 封面缓存：同一封面反复进列表/详情时零网络、零 sidecar。
+    final String coverKey = 'cover:${source.id}|$url';
+    final Uint8List? cachedCover = await _readImageCache(coverKey);
+    if (cachedCover != null) return cachedCover;
     await _ensureStarted();
     final http.Request request = http.Request('POST', _uri('/source-image'))
       ..headers.addAll(await _headersFor(source))
@@ -358,6 +437,7 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
         'Mihon source returned an empty image',
       );
     }
+    unawaited(_writeImageCache(coverKey, bytes));
     return bytes;
   }
 
