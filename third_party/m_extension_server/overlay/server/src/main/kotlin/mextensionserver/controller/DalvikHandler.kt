@@ -77,7 +77,9 @@ class DalvikHandler {
                                 "[Fushi][sidecar-perf] core-start method=$perfMethod " +
                                     "t=${System.currentTimeMillis()}",
                             )
+                            val stackWatchdog = startCoreStackWatchdog(perfMethod)
                             val coreResult = MihonInvoker.invokeMethod(loadedExtension, dataBody)
+                            stackWatchdog.cancel()
                             perfCoreMs = (System.nanoTime() - perfCoreStart) / 1_000_000
                             coreResult
                         }
@@ -115,6 +117,52 @@ class DalvikHandler {
     /** Attaches [SET_COOKIE_HEADER] when the call actually touched cookies. */
     private fun NanoHTTPD.Response.withJarCookies(payload: String?): NanoHTTPD.Response =
         apply { if (payload != null) addHeader(SET_COOKIE_HEADER, payload) }
+
+    /**
+     * core 调用超过 10s 时每 5s 转储一次全部线程栈（前 3 次足够），
+     * 用于定位「网络请求已完成但 core 迟迟不返回」的 30s 滞留卡在哪一行。
+     */
+    private fun startCoreStackWatchdog(
+        method: String?,
+    ): AutoCloseable {
+        val executor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { runnable ->
+            Thread(runnable, "core-stack-watchdog").apply { isDaemon = true }
+        }
+        val start = System.currentTimeMillis()
+        var dumped = 0
+        val future =
+            executor.scheduleAtFixedRate(
+                {
+                    val elapsed = System.currentTimeMillis() - start
+                    if (dumped >= 3) return@scheduleAtFixedRate
+                    if (elapsed < 10_000) return@scheduleAtFixedRate
+                    dumped++
+                    System.err.println(
+                        "[Fushi][sidecar-stacks] t=${System.currentTimeMillis()} " +
+                            "method=$method elapsedMs=$elapsed dump#$dumped",
+                    )
+                    for ((thread, frames) in Thread.getAllStackTraces()) {
+                        val name = thread.name
+                        if (name.startsWith("core-stack-watchdog")) continue
+                        if (frames.isEmpty()) continue
+                        val depth = minOf(frames.size, 30)
+                        System.err.println(
+                            "[Fushi][sidecar-stacks] -- $name state=${thread.state} frames=${frames.size}",
+                        )
+                        for (i in 0 until depth) {
+                            System.err.println("[Fushi][sidecar-stacks]    ${frames[i]}")
+                        }
+                    }
+                },
+                5,
+                5,
+                java.util.concurrent.TimeUnit.SECONDS,
+            )
+        return AutoCloseable {
+            future.cancel(false)
+            executor.shutdownNow()
+        }
+    }
 
     internal fun errorResponse(error: Throwable): NanoHTTPD.Response {
         logger.error(error) { "Error handling request" }
