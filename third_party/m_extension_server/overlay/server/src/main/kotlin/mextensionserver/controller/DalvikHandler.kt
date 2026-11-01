@@ -34,11 +34,17 @@ class DalvikHandler {
         // jar: the failing call is the one most likely to have rotated the
         // session.
         var pendingJarCookies: String? = null
+        val perfStart = System.nanoTime()
+        var perfBodyMs = -1L
+        var perfMethod: String? = null
         return try {
             val body = mutableMapOf<String, String>()
             session.parseBody(body)
             val json = body["postData"] ?: throw IllegalArgumentException("No JSON body")
             val dataBody = objectMapper.readValue(json, DataBody::class.java)
+            perfMethod = dataBody.method
+            perfBodyMs = (System.nanoTime() - perfStart) / 1_000_000
+            val perfInvokeStart = System.nanoTime()
 
             // A failing call is the *most* likely one to have rotated the
             // session -- a 401/403 usually is the site handing out a fresh
@@ -46,9 +52,13 @@ class DalvikHandler {
             // than only on the success path is what lets the error response
             // carry it back; otherwise the host retries forever with the dead
             // value it already had.
+            var perfSelectMs = -1L
+            var perfCoreMs = -1L
             val invocationResult =
                 MExtensionServerLoader.invokeWithExtension(dataBody.data) { loadedExtension ->
+                    val perfSelectStart = System.nanoTime()
                     val selectedSource = MihonInvoker.selectSource(loadedExtension.sources, dataBody)
+                    perfSelectMs = (System.nanoTime() - perfSelectStart) / 1_000_000
                     MihonInvoker.preparePreferences(dataBody, selectedSource)
                     // Host-owned login session; see [SourceCookieInjection].
                     val domain = SourceCookieInjection.domainOf(selectedSource)
@@ -62,7 +72,10 @@ class DalvikHandler {
                             // extensions go through the shared host loader instead.
                             loadEpisodeVideos(selectedSource, dataBody)
                         } else {
-                            MihonInvoker.invokeMethod(loadedExtension, dataBody)
+                            val perfCoreStart = System.nanoTime()
+                            val coreResult = MihonInvoker.invokeMethod(loadedExtension, dataBody)
+                            perfCoreMs = (System.nanoTime() - perfCoreStart) / 1_000_000
+                            coreResult
                         }
                     } finally {
                         pendingJarCookies =
@@ -74,8 +87,14 @@ class DalvikHandler {
                     }
                 }
 
+            val perfInvokeMs = (System.nanoTime() - perfInvokeStart) / 1_000_000
             val serializableResult = filterResponseForBridge(invocationResult)
             val responseJson = objectMapper.writeValueAsString(serializableResult)
+            System.err.println(
+                "[Fushi][sidecar-perf] /dalvik method=$perfMethod parseMs=$perfBodyMs " +
+                    "selectMs=$perfSelectMs coreMs=$perfCoreMs " +
+                    "invokeMs=$perfInvokeMs totalMs=${(System.nanoTime() - perfStart) / 1_000_000}",
+            )
             NanoHTTPD
                 .newFixedLengthResponse(
                     NanoHTTPD.Response.Status.OK,
