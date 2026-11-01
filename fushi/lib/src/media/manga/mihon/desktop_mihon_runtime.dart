@@ -291,11 +291,16 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     final http.Client? replaced = _imageClients[requestId];
     replaced?.close();
     _imageClients[requestId] = imageClient;
+    final Stopwatch perfWatch = Stopwatch()..start();
     try {
       final http.Response response = await imageClient
           .get(requested, headers: _headers)
           .timeout(const Duration(seconds: 45));
       if (response.statusCode != HttpStatus.ok) {
+        stderr.writeln(
+          '[Fushi][mihon-perf] GET /image req=$requestId '
+          'HTTP_${response.statusCode} ms=${perfWatch.elapsedMilliseconds}',
+        );
         throw MihonRuntimeException(
           'IMAGE_HTTP_${response.statusCode}',
           'Mihon image proxy request failed',
@@ -307,6 +312,10 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
           'Mihon source returned an empty image',
         );
       }
+      stderr.writeln(
+        '[Fushi][mihon-perf] GET /image req=$requestId '
+        'bytes=${response.bodyBytes.length} ms=${perfWatch.elapsedMilliseconds}',
+      );
       return response.bodyBytes;
     } finally {
       if (identical(_imageClients[requestId], imageClient)) {
@@ -331,6 +340,7 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     List<MihonPreference> preferences = const <MihonPreference>[],
   }) async {
     await _ensureStarted();
+    final Stopwatch perfWatch = Stopwatch()..start();
     final http.Request request = http.Request('POST', _uri('/source-image'))
       ..headers.addAll(await _headersFor(source))
       ..body = jsonEncode(<String, Object?>{
@@ -346,12 +356,20 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     await _absorbResponseCookies(source, response.headers);
     if (response.statusCode != HttpStatus.ok) {
       await response.stream.drain<void>().timeout(kMihonSourceImageIdleTimeout);
+      stderr.writeln(
+        '[Fushi][mihon-perf] POST /source-image url=$url '
+        'HTTP_${response.statusCode} ms=${perfWatch.elapsedMilliseconds}',
+      );
       throw MihonRuntimeException(
         'IMAGE_HTTP_${response.statusCode}',
         'Mihon source image request failed',
       );
     }
     final Uint8List bytes = await readMihonSourceImageBytes(response.stream);
+    stderr.writeln(
+      '[Fushi][mihon-perf] POST /source-image url=$url '
+      'bytes=${bytes.length} ms=${perfWatch.elapsedMilliseconds}',
+    );
     if (bytes.isEmpty) {
       throw const MihonRuntimeException(
         'EMPTY_IMAGE',
@@ -833,6 +851,10 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     MihonSource? source,
   }) async {
     await _ensureStarted();
+    final Stopwatch perfWatch = Stopwatch()..start();
+    final Object? perfTag = body['method'] ?? body['url'] ?? body['sourceId'];
+    final int perfDataLen =
+        body['data'] is String ? (body['data']! as String).length : 0;
     try {
       final http.Response response = await _http
           .post(
@@ -847,10 +869,18 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
       if (response.statusCode < 200 || response.statusCode >= 300) {
         throw decodeErrorResponse(response);
       }
-      return response.body.isEmpty ? null : jsonDecode(response.body);
-    } on MihonRuntimeException {
-      rethrow;
+      final Object? decoded =
+          response.body.isEmpty ? null : jsonDecode(response.body);
+      stderr.writeln(
+        '[Fushi][mihon-perf] POST $path tag=$perfTag bodyLen=$perfDataLen '
+        'respLen=${response.body.length} ms=${perfWatch.elapsedMilliseconds}',
+      );
+      return decoded;
     } on TimeoutException catch (error) {
+      stderr.writeln(
+        '[Fushi][mihon-perf] POST $path tag=$perfTag bodyLen=$perfDataLen '
+        'TIMEOUT ms=${perfWatch.elapsedMilliseconds}',
+      );
       // A slow source is not evidence that the shared JVM has died. Killing it
       // here aborts every concurrent source search and silently replays actions.
       throw MihonRuntimeException(
@@ -859,6 +889,10 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
         cause: error,
       );
     } on Object catch (error) {
+      stderr.writeln(
+        '[Fushi][mihon-perf] POST $path tag=$perfTag bodyLen=$perfDataLen '
+        'FAILED ms=${perfWatch.elapsedMilliseconds} err=$error',
+      );
       throw MihonRuntimeException(
         'BRIDGE_IO',
         'M-Extension-Server request failed',
