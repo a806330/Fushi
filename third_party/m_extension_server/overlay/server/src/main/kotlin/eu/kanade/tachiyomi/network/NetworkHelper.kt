@@ -35,18 +35,18 @@ class NetworkHelper(
                 .cookieJar(cookieJar)
                 .addInterceptor { chain ->
                     val request = chain.request()
-                    val netStart = System.nanoTime()
+                    val netStart = System.currentTimeMillis()
                     try {
                         val response = chain.proceed(request)
                         System.err.println(
-                            "[Fushi][sidecar-net] ${request.method} ${request.url} " +
-                                "code=${response.code} ms=${(System.nanoTime() - netStart) / 1_000_000}",
+                            "[Fushi][sidecar-net] t=$netStart ${request.method} ${request.url} " +
+                                "code=${response.code} ms=${System.currentTimeMillis() - netStart}",
                         )
                         response
                     } catch (error: Throwable) {
                         System.err.println(
-                            "[Fushi][sidecar-net] ${request.method} ${request.url} " +
-                                "err=${error.javaClass.simpleName} ms=${(System.nanoTime() - netStart) / 1_000_000}",
+                            "[Fushi][sidecar-net] t=$netStart ${request.method} ${request.url} " +
+                                "err=${error.javaClass.simpleName} ms=${System.currentTimeMillis() - netStart}",
                         )
                         throw error
                     }
