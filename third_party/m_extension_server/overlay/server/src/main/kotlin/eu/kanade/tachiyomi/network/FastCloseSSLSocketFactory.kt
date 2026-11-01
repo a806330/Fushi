@@ -26,7 +26,7 @@ class FastCloseSSLSocketFactory(
 
     private fun wrap(socket: Socket): Socket {
         val ssl = socket as? SSLSocket ?: return socket
-        return FastCloseSSLSocket(ssl)
+        return FastCloseSSLSocket.create(ssl)
     }
 
     override fun getDefaultCipherSuites(): Array<String> = delegate.defaultCipherSuites
@@ -147,16 +147,6 @@ class FastCloseSSLSocket private constructor(
     override fun getApplicationProtocol(): String = delegate.applicationProtocol
 
     override fun getHandshakeApplicationProtocol(): String = delegate.handshakeApplicationProtocol
-
-    override fun setHandshakeApplicationProtocolSelector(
-        selector: java.util.function.BiFunction<in SSLSocket, in List<String>, out String>?,
-    ) {
-        delegate.setHandshakeApplicationProtocolSelector(selector)
-    }
-
-    override fun getHandshakeApplicationProtocolSelector():
-        java.util.function.BiFunction<in SSLSocket, in List<String>, out String>? =
-        delegate.handshakeApplicationProtocolSelector
 
     override fun getInetAddress(): InetAddress? = delegate.inetAddress
 
