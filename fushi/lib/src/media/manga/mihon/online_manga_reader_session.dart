@@ -19,7 +19,7 @@ import 'package:fushi/src/media/manga/mihon/mihon_models.dart';
 const String kMangaStreamCacheDirName = 'manga_stream_cache';
 
 /// 同时在飞的取页请求上限（前台 + 预取共用）。
-const int kOnlineMangaPageConcurrency = 3;
+const int kOnlineMangaPageConcurrency = 8;
 
 /// 每次取页时顺带往阅读方向（页号增大）预取几页。
 ///
