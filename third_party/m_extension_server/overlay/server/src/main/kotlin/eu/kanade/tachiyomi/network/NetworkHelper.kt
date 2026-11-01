@@ -33,6 +33,24 @@ class NetworkHelper(
             HostProxyPolicy
                 .configureClient(OkHttpClient.Builder())
                 .cookieJar(cookieJar)
+                .addInterceptor { chain ->
+                    val request = chain.request()
+                    val netStart = System.nanoTime()
+                    try {
+                        val response = chain.proceed(request)
+                        System.err.println(
+                            "[Fushi][sidecar-net] ${request.method} ${request.url} " +
+                                "code=${response.code} ms=${(System.nanoTime() - netStart) / 1_000_000}",
+                        )
+                        response
+                    } catch (error: Throwable) {
+                        System.err.println(
+                            "[Fushi][sidecar-net] ${request.method} ${request.url} " +
+                                "err=${error.javaClass.simpleName} ms=${(System.nanoTime() - netStart) / 1_000_000}",
+                        )
+                        throw error
+                    }
+                }
                 .addInterceptor(UncaughtExceptionInterceptor())
                 .addInterceptor(UserAgentInterceptor(::defaultUserAgentProvider))
                 .addInterceptor(CloudflareInterceptor())
