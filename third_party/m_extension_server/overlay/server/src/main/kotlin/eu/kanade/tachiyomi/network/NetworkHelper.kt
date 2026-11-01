@@ -62,12 +62,16 @@ class NetworkHelper(
                     },
                 ).addInterceptor(BrotliInterceptor)
                 .connectTimeout(30, TimeUnit.SECONDS)
-                .readTimeout(30, TimeUnit.SECONDS)
+                // 30s readTimeout 的真实代价：Cloudflare 类服务器响应后不发 TLS close_notify，
+                // okhttp 关连接时 SSLSocket 在 deplete 里傻等「耗尽残余输入」，正好挂满
+                // readTimeout——这就是每个首次请求白等 30s 的元凶（线程栈实锤）。降到 5s：
+                // 正常响应的读间隔远小于 5s，而关连接挂起最多 5s。
+                .readTimeout(5, TimeUnit.SECONDS)
                 .callTimeout(2, TimeUnit.MINUTES)
                 .cache(
                     Cache(
                         directory = Files.createTempDirectory("m_network_cache").toFile(),
-                        maxSize = 5L * 1024 * 1024, // 5 MiB
+                        maxSize = 64L * 1024 * 1024, // 64 MiB：5MiB 会让二次访问大量 miss，重新走真实网络并再次触发关连接挂起
                     ),
                 )
         builder.build()
