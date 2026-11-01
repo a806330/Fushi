@@ -62,11 +62,11 @@ class NetworkHelper(
                     },
                 ).addInterceptor(BrotliInterceptor)
                 .connectTimeout(30, TimeUnit.SECONDS)
-                // 30s readTimeout 的真实代价：Cloudflare 类服务器响应后不发 TLS close_notify，
-                // okhttp 关连接时 SSLSocket 在 deplete 里傻等「耗尽残余输入」，正好挂满
-                // readTimeout——这就是每个首次请求白等 30s 的元凶（线程栈实锤）。降到 5s：
-                // 正常响应的读间隔远小于 5s，而关连接挂起最多 5s。
-                .readTimeout(5, TimeUnit.SECONDS)
+                // 关连接挂起已由 FastCloseSSLSocketFactory 独立压到 250ms（只影响 close，
+                // 不碰正常读取），所以这里可以放宽读取容忍：5s 曾误杀 mycomic 偶发的
+                // 慢响应（>5s 即 Read timed out → 重试耗尽 → 「加载失败」）。15s 兜住
+                // 实测最慢 ~10s 的响应，同时仍能及时暴露真死链。
+                .readTimeout(15, TimeUnit.SECONDS)
                 .callTimeout(2, TimeUnit.MINUTES)
                 .sslSocketFactory(
                     FastCloseSSLSocketFactory(javax.net.ssl.SSLContext.getDefault().socketFactory),
