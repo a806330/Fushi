@@ -79,7 +79,7 @@ class DalvikHandler {
                             )
                             val stackWatchdog = startCoreStackWatchdog(perfMethod)
                             val coreResult = MihonInvoker.invokeMethod(loadedExtension, dataBody)
-                            stackWatchdog.cancel()
+                            stackWatchdog.close()
                             perfCoreMs = (System.nanoTime() - perfCoreStart) / 1_000_000
                             coreResult
                         }
