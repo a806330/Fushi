@@ -42,6 +42,12 @@ class MihonManager extends ChangeNotifier {
     coverCache = MihonCoverCache(
       Directory(p.join(rootDirectory.path, 'cache', 'covers')),
       maxAge: coverCacheMaxAge,
+      // 默认 512 条 / 64MB 在真实书架规模下会把最旧的一批封面 trim 掉
+      //（352 张就到 65MB），而书架封面缓存 miss 后 UI 层不会自动回源，
+      // 表现就是书架上一批老漫画封面永久空白。放宽到 2048 条 / 256MB，
+      // 让 trim 只在真正长期不用的极端规模下才发生。
+      maxEntries: 2048,
+      maxBytes: 256 * 1024 * 1024,
     );
     if (ownsRuntime && MihonRuntimeFactory.usesDesktopSidecar) {
       _exitShutdown = ExitFlushRegistry.instance.register(
@@ -146,12 +152,94 @@ class MihonManager extends ChangeNotifier {
       await _recoverAbandonedPreview();
       await _clearStagedApks();
       await _refreshStores();
+      // 惰性补齐书架缺失的封面（见 [backfillMissingLibraryCovers]）；
+      // fire-and-forget，不阻塞 initialise，失败静默等下次启动重试。
+      unawaited(backfillMissingLibraryCovers());
     } catch (exception) {
       error = '$exception';
       rethrow;
     } finally {
       loading = false;
       _notify();
+    }
+  }
+
+  /// 书架封面回填：在线漫画入库时若封面下载失败，`epub_books.cover_path` 会
+  /// 留空，而书架只认本地封面文件——表现为一批老条目永久空白，尽管元数据里
+  /// 的 `series.coverUrl` 明明还在（实测 21 本漫画里 3 本如此）。
+  ///
+  /// 逐条处理 `format='manga'` 且 `cover_path` 为空的条目：缓存命中直接落盘，
+  /// 未命中经扩展网络栈拉一次（[MihonCoverCache.load] 会顺手写回封面磁盘缓存，
+  /// 不占浏览页的封面并发名额）。成功即写 `<extract_dir>/cover.jpg` 并更新
+  /// `cover_path`。单条失败只跳过该条，下次启动重试；整体不抛错。
+  Future<void> backfillMissingLibraryCovers() async {
+    List<EpubBookRow> missing;
+    try {
+      missing =
+          await (database.select(database.epubBooks)
+                ..where(
+                  (tbl) =>
+                      tbl.format.equals('manga') &
+                      (tbl.coverPath.isNull() | tbl.coverPath.equals('')),
+                ))
+              .get();
+    } catch (_) {
+      return;
+    }
+    for (final EpubBookRow book in missing) {
+      try {
+        final String? metadataJson = book.sourceMetadata;
+        final String? extractDir = book.extractDir;
+        if (metadataJson == null || extractDir == null || extractDir.isEmpty) {
+          continue;
+        }
+        final Object? decoded = jsonDecode(metadataJson);
+        if (decoded is! Map<String, Object?>) continue;
+        final Object? series = decoded['series'];
+        if (series is! Map<String, Object?>) continue;
+        final Object? coverUrl = series['coverUrl'];
+        final Object? extensionPackage = decoded['extensionPackage'];
+        final Object? sourceId = decoded['sourceId'];
+        if (coverUrl is! String ||
+            !coverUrl.startsWith('http') ||
+            extensionPackage is! String ||
+            extensionPackage.isEmpty ||
+            sourceId is! String ||
+            sourceId.isEmpty) {
+          continue;
+        }
+        MangaOnlineSourceRow? sourceRow;
+        for (final MangaOnlineSourceRow row in sources) {
+          if (row.extensionPackage == extensionPackage &&
+              row.sourceId == sourceId) {
+            sourceRow = row;
+            break;
+          }
+        }
+        if (sourceRow == null) continue;
+        final MihonSourceContext context = await contextForSource(sourceRow);
+        final Uint8List bytes = await coverCache.load(
+          extensionPackage: extensionPackage,
+          sourceId: sourceId,
+          url: coverUrl,
+          fetch: (bool Function() stillWanted) =>
+              runtime.fetchSourceImage(
+                context.extension,
+                context.source,
+                coverUrl,
+                preferences: context.preferences,
+              ),
+        );
+        if (bytes.isEmpty) continue;
+        final File target = File(p.join(extractDir, 'cover.jpg'));
+        await target.parent.create(recursive: true);
+        await target.writeAsBytes(bytes, flush: true);
+        await (database.update(database.epubBooks)
+              ..where((tbl) => tbl.bookKey.equals(book.bookKey)))
+            .write(EpubBooksCompanion(coverPath: const Value('cover.jpg')));
+      } catch (_) {
+        // 单条失败（源已卸载 / 网络失败 / CF 挑战）跳过，下次启动重试。
+      }
     }
   }
 
