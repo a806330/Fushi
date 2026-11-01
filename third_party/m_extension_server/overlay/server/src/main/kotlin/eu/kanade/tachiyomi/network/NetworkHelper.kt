@@ -68,6 +68,10 @@ class NetworkHelper(
                 // 正常响应的读间隔远小于 5s，而关连接挂起最多 5s。
                 .readTimeout(5, TimeUnit.SECONDS)
                 .callTimeout(2, TimeUnit.MINUTES)
+                .sslSocketFactory(
+                    FastCloseSSLSocketFactory(javax.net.ssl.SSLContext.getDefault().socketFactory),
+                    defaultTrustManager(),
+                )
                 .cache(
                     Cache(
                         directory = Files.createTempDirectory("m_network_cache").toFile(),
@@ -75,6 +79,19 @@ class NetworkHelper(
                     ),
                 )
         builder.build()
+    }
+
+    /**
+     * 系统 默认信任库 的 X509TrustManager，给 [FastCloseSSLSocketFactory] 配套。
+     * 信任行为与 JVM 默认完全一致（包括运行期被宿主注入的自定义 CA——那些走的是
+     * SSLContext.setDefault，getDefault() 会继承）。
+     */
+    private fun defaultTrustManager(): javax.net.ssl.X509TrustManager {
+        val factory = javax.net.ssl.TrustManagerFactory.getInstance(
+            javax.net.ssl.TrustManagerFactory.getDefaultAlgorithm(),
+        )
+        factory.init(null as java.security.KeyStore?)
+        return factory.trustManagers.filterIsInstance<javax.net.ssl.X509TrustManager>().first()
     }
 
     val cloudflareClient by lazy {
