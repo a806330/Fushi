@@ -138,6 +138,12 @@ class FastCloseSSLSocket private constructor(
 
     override fun getWantClientAuth(): Boolean = delegate.wantClientAuth
 
+    override fun setEnableSessionCreation(enable: Boolean) {
+        delegate.enableSessionCreation = enable
+    }
+
+    override fun getEnableSessionCreation(): Boolean = delegate.enableSessionCreation
+
     override fun getSSLParameters(): SSLParameters = delegate.sslParameters
 
     override fun setSSLParameters(params: SSLParameters?) {
