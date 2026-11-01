@@ -73,6 +73,10 @@ class DalvikHandler {
                             loadEpisodeVideos(selectedSource, dataBody)
                         } else {
                             val perfCoreStart = System.nanoTime()
+                            System.err.println(
+                                "[Fushi][sidecar-perf] core-start method=$perfMethod " +
+                                    "t=${System.currentTimeMillis()}",
+                            )
                             val coreResult = MihonInvoker.invokeMethod(loadedExtension, dataBody)
                             perfCoreMs = (System.nanoTime() - perfCoreStart) / 1_000_000
                             coreResult
