@@ -96,7 +96,7 @@ class _MihonCatalog extends OnlineSourceCatalog<MihonCatalogueEntry> {
   final MihonManager manager;
   final MihonBrowseTarget target;
   final MihonSourceImageLoadQueue _imageLoadQueue = MihonSourceImageLoadQueue(
-    maxConcurrent: 4,
+    maxConcurrent: 10,
   );
   MihonSourceContext? _sourceContext;
   List<MihonFilter> _filters = const <MihonFilter>[];
@@ -457,8 +457,8 @@ class _MihonSourceImageState extends State<MihonSourceImage> {
 
 /// 封面在并发闸门里最多排多久（BUG-2450）。
 ///
-/// 桌面封面单张首响应 / 空闲超时各 90s，4 并发 × 90s 串行排队时整页封面会一起
-/// 转圈几分钟；排到 30s 还没轮上就直接落失败态（可点重试），把慢源的代价限制在
+/// 桌面封面单张首响应 / 空闲超时各 20s，10 并发时整页封面仍受最慢单张约束；
+/// 排到 30s 还没轮上就直接落失败态（可点重试），把慢源的代价限制在
 /// 它自己那几格上。
 const Duration kMihonSourceImageQueueWaitTimeout = Duration(seconds: 30);
 
