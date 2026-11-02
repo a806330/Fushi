@@ -129,6 +129,9 @@ String mangaDownloadJobId({
 class _CancelToken {
   bool cancelled = false;
   bool stopped = false;
+  /// 取消时**保留**已落地的章目录（不删）；用于「暂停」——之后由 resume / retry
+  /// 把行复位成 queued 原地续跑。与 [cancelled]（真放弃并删半成品）区分。
+  bool cancelKeepFiles = false;
 }
 
 class _ActiveJob {
@@ -199,6 +202,22 @@ class MangaDownloadService {
   bool _wakeRequested = false;
   _ActiveJob? _active;
   Completer<void>? _idle;
+
+  /// 「暂停」态的任务（内存态，不落库）：数据库 status 仍记为 `cancelled`
+  /// （既有的 5 值 CHECK 不允许 `paused`），靠这个集合在当次会话内区分「暂停」与
+  /// 「真取消」。续传 / 删任务时清掉；进程重启后集合清空，暂停任务退化为
+  /// `cancelled`，UI 仍给「继续」（retry 复用 cancelled → queued 复位）。
+  final Set<String> _pausedJobIds = <String>{};
+
+  /// 任务是否处于「暂停」态（仅当次会话内有效）。
+  bool isPaused(String jobId) => _pausedJobIds.contains(jobId);
+
+  /// 「仅明文落盘」模式的导出根目录映射：jobId → 用户所选根目录。内存态；跨进程重启
+  /// 后丢失（那时暂停/删除导出目录会退化为找不到——可接受，删任务行仍正常）。
+  final Map<String, String> _exportRoots = <String, String>{};
+
+  /// 取任务的导出根目录（null = 非导出任务，走既有内部目录逻辑）。
+  String? exportRootOf(String jobId) => _exportRoots[jobId];
 
   int get _now => _clock().millisecondsSinceEpoch;
 
@@ -405,7 +424,26 @@ class MangaDownloadService {
     }
   }
 
-  /// 取消：`queued` 直接改状态；正在飞的任务中止并删半成品目录。
+  /// 批量入队到「仅明文落盘」模式：每章按既有逻辑入队到内部目录，完成后由 [_markDone]
+  /// 整体搬到 [root]/<作品名>/<章名>/ 并删内部副本。[root] 由宿主每次弹文件夹选择框取得。
+  Future<void> enqueueChaptersToExport({
+    required OnlineMangaLibraryEntry entry,
+    required Iterable<OnlineMangaChapter> chapters,
+    required String root,
+    required bool autoOcr,
+  }) async {
+    for (final OnlineMangaChapter chapter in chapters) {
+      final MangaDownloadJobRow row = await enqueueChapter(
+        entry: entry,
+        chapter: chapter,
+        autoOcr: autoOcr,
+      );
+      _exportRoots[row.jobId] = root;
+    }
+  }
+
+  /// 取消（真放弃）：`queued` 直接改状态并删半成品目录；正在飞的任务中止并删半成品。
+  /// 与 [pause] 区分：cancel 删已落地的页，pause 保留。
   Future<void> cancel(String jobId) async {
     final MangaDownloadJobRow? row = await _database.getMangaDownloadJob(jobId);
     if (row == null) return;
@@ -426,7 +464,8 @@ class MangaDownloadService {
     }
   }
 
-  /// 重试 `failed` / `cancelled` 的任务。
+  /// 重试 `failed` / `cancelled` 的任务（同一行复位成 `queued` 续跑，BUG-1433）。
+  /// 「暂停」后的任务（status 也是 `cancelled`）走这里继续。
   Future<void> retry(String jobId) async {
     final MangaDownloadJobRow? row = await _database.getMangaDownloadJob(jobId);
     if (row == null) return;
@@ -434,6 +473,7 @@ class MangaDownloadService {
         row.status != MangaDownloadJobStatus.cancelled) {
       return;
     }
+    _pausedJobIds.remove(jobId);
     await _database.updateMangaDownloadJobStatus(
       jobId,
       status: MangaDownloadJobStatus.queued,
@@ -453,7 +493,160 @@ class MangaDownloadService {
       active.abort?.call();
       await active.done.future;
     }
+    _pausedJobIds.remove(jobId);
     await _database.deleteMangaDownloadJob(jobId);
+  }
+
+  /// 暂停：queued / running → 中止在飞任务并保留已落地的页（不删章目录），status 记
+  /// `cancelled`（既有 5 值 CHECK 不允许单独的 `paused`，故复用 cancelled 并在内存
+  /// [_pausedJobIds] 里标出）。续传由 [resume]（= [retry] 复位 cancelled → queued）
+  /// 完成，已落地的页由 [_download] 按磁盘现状跳过。
+  Future<void> pause(String jobId) async {
+    final MangaDownloadJobRow? row = await _database.getMangaDownloadJob(jobId);
+    if (row == null) return;
+    final _ActiveJob? active = _active;
+    if (active != null && active.jobId == jobId) {
+      // 正在飞：让执行体在捕获 [_Cancelled] 时保留章目录（cancelKeepFiles）。
+      active.token.cancelled = true;
+      active.token.cancelKeepFiles = true;
+      active.abort?.call();
+      _pausedJobIds.add(jobId);
+      return;
+    }
+    if (row.status == MangaDownloadJobStatus.queued ||
+        row.status == MangaDownloadJobStatus.running) {
+      await _database.updateMangaDownloadJobStatus(
+        jobId,
+        status: MangaDownloadJobStatus.cancelled,
+        updatedAt: _now,
+      );
+      _pausedJobIds.add(jobId);
+    }
+  }
+
+  /// 继续：把「暂停」（status = `cancelled` 且记在 [_pausedJobIds]）或 `failed` 的
+  /// 任务复位成 `queued` 续跑；复用 [retry] 的同一行复位语义。
+  Future<void> resume(String jobId) async {
+    await retry(jobId);
+  }
+
+  /// 删除任务行；[deleteFiles] 为真时连已下载内容一起删（内部章目录 + 明文导出目录）。
+  ///
+  /// 与 [cancel] 不同：cancel 只中止在飞任务并删半成品；本方法面向「任务列表里删掉
+  /// 这一条并清掉它落地的文件」。
+  Future<void> deleteJob(String jobId, {required bool deleteFiles}) async {
+    final MangaDownloadJobRow? row = await _database.getMangaDownloadJob(jobId);
+    if (row == null) return;
+    final _ActiveJob? active = _active;
+    if (active != null && active.jobId == jobId) {
+      active.token.cancelled = true;
+      active.abort?.call();
+      await active.done.future;
+    }
+    if (deleteFiles) {
+      await _deleteChapterContent(row);
+    }
+    _pausedJobIds.remove(jobId);
+    await _database.deleteMangaDownloadJob(jobId);
+  }
+
+  /// 删除一章的已下载内容：内部章目录（manga.json + images）。「仅明文落盘」模式下
+  /// 的明文导出目录删除由 [_deleteCleanExportIfAny] 补充（见需求 A 落盘改造）。
+  Future<void> _deleteChapterContent(MangaDownloadJobRow job) async {
+    if (job.kind != MangaDownloadJobKind.chapter) return;
+    try {
+      final EpubBookRow? row = await _database.getEpubBook(job.bookKey);
+      if (row != null) {
+        await deleteChapterDownload(
+          await MangaStorage.bookPath(row.bookKey),
+          job.chapterKey,
+        );
+      }
+      // 「仅明文落盘」模式下，导出目录独立于内部存储，也要清掉。
+      await _deleteCleanExportIfAny(job);
+    } on Object catch (error, stack) {
+      ErrorLogService.instance.log(
+        'MangaDownloadService.deleteContent ${job.jobId}',
+        error,
+        stack,
+      );
+    }
+  }
+
+  /// 删除「仅明文落盘」模式下可能存在的明文导出目录（按 [_exportRoots] 查根目录后拼
+  /// `<root>/<作品名>/<章名>/`）。无根目录记录时静默跳过（与内部章目录删除互不影响）。
+  /// 跨进程重启后内存映射丢失，导出目录可能删不到——此时由用户手动清理，删任务行仍正常。
+  Future<void> _deleteCleanExportIfAny(MangaDownloadJobRow job) async {
+    if (job.kind != MangaDownloadJobKind.chapter) return;
+    final String? root = _exportRoots.remove(job.jobId);
+    if (root == null) return;
+    final Directory abs = Directory(
+      p.join(root, _safeName(job.title), _safeName(job.chapterTitle)),
+    );
+    try {
+      if (await abs.exists()) await abs.delete(recursive: true);
+    } on Object catch (error, stack) {
+      ErrorLogService.instance.log(
+        'MangaDownloadService.deleteExport ${job.jobId}',
+        error,
+        stack,
+      );
+    }
+  }
+
+  /// 把刚下完的内部章目录整体搬到明文导出目录：`<root>/<作品名>/<章名>/<page-NNN.ext>`。
+  /// 只搬图片，不要 manga.json；搬完删内部章目录（Fushi 不留 hash 副本）。跨盘 rename
+  /// 会失败，自动退化为「复制 + 删除源」。
+  Future<void> _moveChapterToExport(
+    MangaDownloadJobRow job,
+    Directory chapterDir,
+  ) async {
+    final String? root = _exportRoots[job.jobId];
+    if (root == null) return;
+    final Directory target = Directory(
+      p.join(root, _safeName(job.title), _safeName(job.chapterTitle)),
+    );
+    try {
+      await target.create(recursive: true);
+      final Directory images = mangaChapterImagesDirectory(chapterDir);
+      if (await images.exists()) {
+        await for (final FileSystemEntity entity in images.list()) {
+          if (entity is File && !entity.path.endsWith('.tmp')) {
+            final File dest = File(p.join(target.path, p.basename(entity.path)));
+            if (await dest.exists()) await dest.delete();
+            await _moveFile(entity, dest);
+          }
+        }
+      }
+      // 删内部章目录（manga.json + 已搬空的 images + 空壳）。
+      if (await chapterDir.exists()) {
+        await chapterDir.delete(recursive: true);
+      }
+    } on Object catch (error, stack) {
+      ErrorLogService.instance.log(
+        'MangaDownloadService.exportMove ${job.jobId}',
+        error,
+        stack,
+      );
+    }
+  }
+
+  /// 移动文件；跨文件系统（跨盘）rename 抛 [FileSystemException]，退化成复制 + 删源。
+  static Future<void> _moveFile(File src, File dest) async {
+    try {
+      await src.rename(dest.path);
+    } on FileSystemException {
+      await src.copy(dest.path);
+      await src.delete();
+    }
+  }
+
+  /// Windows / 各平台都安全的文件夹名：清掉非法字符与首尾空白，空名回退 `untitled`。
+  static String _safeName(String name) {
+    final String cleaned = name
+        .replaceAll(RegExp(r'[\\/:*?"<>|\r\n\t]'), '_')
+        .trim();
+    return cleaned.isEmpty ? 'untitled' : cleaned;
   }
 
   /// 删所有已结束（done / failed / cancelled）的任务行（下载中心「清除已完成」）。
@@ -568,6 +761,16 @@ class MangaDownloadService {
         // 服务停止：行保持 running，下次 start() 复位成 queued 续跑。
         return;
       } on _Cancelled {
+        if (token.cancelKeepFiles) {
+          // 用户「暂停」：保留已落地的页（不删章目录），状态记 cancelled，之后
+          // [resume]（= [retry]）把行复位成 queued 原地续跑。
+          await _database.updateMangaDownloadJobStatus(
+            job.jobId,
+            status: MangaDownloadJobStatus.cancelled,
+            updatedAt: _now,
+          );
+          return;
+        }
         await _database.updateMangaDownloadJobStatus(
           job.jobId,
           status: MangaDownloadJobStatus.cancelled,
@@ -607,6 +810,14 @@ class MangaDownloadService {
         );
         if (token.stopped) return;
         if (token.cancelled) {
+          if (token.cancelKeepFiles) {
+            await _database.updateMangaDownloadJobStatus(
+              job.jobId,
+              status: MangaDownloadJobStatus.cancelled,
+              updatedAt: _now,
+            );
+            return;
+          }
           await _database.updateMangaDownloadJobStatus(
             job.jobId,
             status: MangaDownloadJobStatus.cancelled,
@@ -876,6 +1087,9 @@ class MangaDownloadService {
       clearLastError: true,
       completedAt: now,
     );
+    // 「仅明文落盘」模式：把刚写好的内部章目录整体搬到用户所选明文根目录
+    // `<root>/<作品名>/<章名>/`，并删内部副本——Fushi 自己不再留 hash 副本。
+    await _moveChapterToExport(job, chapterDir);
     final MangaDownloadJobRow? current = await _database.getMangaDownloadJob(
       job.jobId,
     );
