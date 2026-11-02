@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:file_picker/file_picker.dart';
 import 'package:fushi/src/media/downloads/download_source_method.dart';
 import 'package:fushi/src/media/manga/mihon/mihon_cloudflare_action.dart';
 import 'package:fushi/src/media/manga/mihon/mihon_web_login_page.dart';
@@ -194,6 +195,12 @@ class _MangaSeriesPageState extends ConsumerState<MangaSeriesPage> {
       const <String, MangaDownloadJobRow>{};
   Set<String> _downloaded = const <String>{};
   StreamSubscription<void>? _jobsWatch;
+
+  /// 章节多选（批量下载 / 批量删除下载）：进入多选的意图（'download' / 'delete'）
+  /// 与已选章节 key。[_selectionMode] 为假时这套状态不参与任何渲染。
+  bool _selectionMode = false;
+  String? _selectionIntent;
+  Set<String> _selectedChapterKeys = const <String>{};
 
   /// OCR 进度（BUG-2481）：注册表的「任务集合变了」信号 + 当前任务的事件流。
   /// 页面只观察，不拥有任务（所有权在注册表，BUG-2449）。
@@ -436,10 +443,17 @@ class _MangaSeriesPageState extends ConsumerState<MangaSeriesPage> {
       row.bookKey,
     );
     final String bookDir = await MangaStorage.bookPath(row.bookKey);
-    final Set<String> downloaded = await downloadedChapterKeys(
+    Set<String> downloaded = await downloadedChapterKeys(
       bookDir,
       entry.chapters.map((OnlineMangaChapter chapter) => chapter.key),
     );
+    // 「仅明文落盘」模式下没有内部副本，已完成的任务（status = done）也要算作已下载，
+    // 让详情页下载状态来自任务记录而非磁盘判据。
+    downloaded = <String>{
+      ...downloaded,
+      for (final MangaDownloadJobRow job in jobs.values)
+        if (job.status == MangaDownloadJobStatus.done) job.chapterKey,
+    };
     if (!mounted) return;
     setState(() {
       _jobs = jobs;
@@ -534,6 +548,153 @@ class _MangaSeriesPageState extends ConsumerState<MangaSeriesPage> {
           severity: ToastSeverity.error,
         );
       }
+    }
+    await _refreshDownloadState();
+  }
+
+  // ── 章节多选：批量下载 / 批量删除下载 ──────────────────────────
+
+  /// 进入章节多选，意图决定确认时的动作（'download' = 导出明文文件夹，'delete'
+  /// = 删除本地下载）。清空已选集，渲染切到多选态。
+  void _enterChapterSelection(String intent) {
+    if (_entry == null) return;
+    setState(() {
+      _selectionMode = true;
+      _selectionIntent = intent;
+      _selectedChapterKeys = const <String>{};
+    });
+  }
+
+  /// 退出多选并清空选择。
+  void _exitChapterSelection() {
+    setState(() {
+      _selectionMode = false;
+      _selectionIntent = null;
+      _selectedChapterKeys = const <String>{};
+    });
+  }
+
+  /// 点按章节（多选态）：切换其选中态。
+  void _toggleSelectedChapter(OnlineMangaChapter chapter) {
+    setState(() {
+      final Set<String> next = Set<String>.from(_selectedChapterKeys);
+      if (next.contains(chapter.key)) {
+        next.remove(chapter.key);
+      } else {
+        next.add(chapter.key);
+      }
+      _selectedChapterKeys = next;
+    });
+  }
+
+  /// 全选：当前可见章节全部选中（与列表渲染一致的筛选 / 排序）。
+  void _selectAllChapters() {
+    setState(() {
+      _selectedChapterKeys = MangaChapterList.visibleChaptersOf(
+        _entry,
+        _unreadOnly,
+        _newestFirst,
+        _states,
+      ).map((OnlineMangaChapter chapter) => chapter.key).toSet();
+    });
+  }
+
+  /// 反选：可见章节里没选中的变选中、已选中的取消。
+  void _invertSelectedChapters() {
+    setState(() {
+      final Set<String> visible = MangaChapterList.visibleChaptersOf(
+        _entry,
+        _unreadOnly,
+        _newestFirst,
+        _states,
+      ).map((OnlineMangaChapter chapter) => chapter.key).toSet();
+      _selectedChapterKeys = <String>{
+        for (final String key in visible)
+          if (!_selectedChapterKeys.contains(key)) key,
+      };
+    });
+  }
+
+  /// 确认多选：按意图分发（明细见 [_downloadSelectedChapters] / [_deleteSelectedChapters]）。
+  Future<void> _confirmChapterSelection() async {
+    final String? intent = _selectionIntent;
+    final Set<String> selected = _selectedChapterKeys;
+    if (intent == null || selected.isEmpty) {
+      _exitChapterSelection();
+      return;
+    }
+    if (intent == 'download') {
+      await _downloadSelectedChapters(selected);
+    } else if (intent == 'delete') {
+      await _deleteSelectedChapters(selected);
+    }
+    if (mounted) _exitChapterSelection();
+  }
+
+  /// 批量删除选中章节的本地下载：有任务行的走 [MangaDownloadService.deleteJob]
+  /// （连行带内容一起删），仅磁盘落地的走 [deleteChapterDownload]。
+  Future<void> _deleteSelectedChapters(Set<String> selected) async {
+    final String? bookKey = _bookKey;
+    final AppModel? appModel = _appModelOrNull;
+    if (bookKey == null || appModel == null) return;
+    int deleted = 0;
+    for (final String chapterKey in selected) {
+      final MangaDownloadJobRow? job = _jobs[chapterKey];
+      try {
+        if (job != null) {
+          await appModel.mangaDownloadService.deleteJob(
+            job.jobId,
+            deleteFiles: true,
+          );
+        } else if (_downloaded.contains(chapterKey)) {
+          await deleteChapterDownload(
+            await MangaStorage.bookPath(bookKey),
+            chapterKey,
+          );
+        }
+        deleted += 1;
+      } on Object catch (error, stack) {
+        ErrorLogService.instance.log(
+          'MangaSeriesPage.deleteSelected $chapterKey',
+          error,
+          stack,
+        );
+      }
+    }
+    await _refreshDownloadState();
+    if (mounted && deleted > 0) {
+      FushiToast.show(msg: t.storage_entry_delete_done);
+    }
+  }
+
+  /// 批量下载选中章节到用户选择的明文文件夹（需求 A）：每次确认都重新弹文件夹选择框，
+  /// 写 `<root>/<漫画名>/<章节名>/<NNN.ext>`，无内部 hash 副本。具体落盘在
+  /// [MangaDownloadService] 的「仅明文落盘」模式里实现（见需求 A 落盘改造）。
+  Future<void> _downloadSelectedChapters(Set<String> selected) async {
+    final OnlineMangaLibraryEntry? entry = _entry;
+    final AppModel? appModel = _appModelOrNull;
+    if (entry == null || appModel == null || _bookKey == null) return;
+    final List<OnlineMangaChapter> chapters = <OnlineMangaChapter>[
+      for (final OnlineMangaChapter chapter in entry.chapters)
+        if (selected.contains(chapter.key)) chapter,
+    ];
+    if (chapters.isEmpty) return;
+    // 「仅明文落盘」模式：每次都弹文件夹选择框让用户指定根目录；下载完成后服务把每章
+    // 搬到 <root>/<作品名>/<章名>/ 并删内部副本（需求 A）。
+    final String? root = await FilePicker.platform.getDirectoryPath(
+      dialogTitle: '选择漫画保存位置',
+    );
+    if (root == null) return; // 用户取消选择，不改动任何状态。
+    await appModel.mangaDownloadService.enqueueChaptersToExport(
+      entry: entry,
+      chapters: chapters,
+      root: root,
+      autoOcr: false,
+    );
+    if (mounted) {
+      FushiToast.show(
+        msg: t.manga_series_download_all_queued(count: chapters.length),
+      );
     }
     await _refreshDownloadState();
   }
@@ -1584,6 +1745,12 @@ class _MangaSeriesPageState extends ConsumerState<MangaSeriesPage> {
           languageScope: _languageScope,
           onSiblingSourceTap: (OnlineMangaSiblingSource sibling) =>
               unawaited(_openSiblingSource(sibling)),
+          // 章节多选：勾选 + 全选 / 反选（批量下载 / 批量删除下载）。
+          selectionMode: _selectionMode,
+          selectedChapterKeys: _selectedChapterKeys,
+          onToggleSelect: _toggleSelectedChapter,
+          onSelectAll: _selectAllChapters,
+          onInvertSelection: _invertSelectedChapters,
           onDownload: _bookKey == null
               ? null
               : (OnlineMangaChapter chapter) =>
@@ -1973,6 +2140,29 @@ class _MangaSeriesPageState extends ConsumerState<MangaSeriesPage> {
     final OnlineMangaLibraryEntry? entry = _entry;
     final bool inLibrary = _row != null;
     final OnlineMangaLoginTarget? login = _loginTarget;
+    // 章节多选态：工具条只剩「取消 / 确认(N)」，其余动作收起。
+    if (_selectionMode) {
+      final int n = _selectedChapterKeys.length;
+      final bool isDelete = _selectionIntent == 'delete';
+      return <Widget>[
+        MediaDetailSecondaryButton(
+          buttonKey: const ValueKey<String>('manga_chapter_selection_cancel'),
+          icon: FushiIcons.close,
+          label: t.dialog_cancel,
+          onPressed: _busy ? null : _exitChapterSelection,
+        ),
+        MediaDetailSecondaryButton(
+          buttonKey: const ValueKey<String>(
+            'manga_chapter_selection_confirm',
+          ),
+          icon: isDelete ? FushiIcons.delete : FushiIcons.download,
+          label: isDelete ? '删除选中($n)' : '下载选中($n)',
+          onPressed: _busy || n == 0
+              ? null
+              : () => unawaited(_confirmChapterSelection()),
+        ),
+      ];
+    }
     return <Widget>[
       // 同一个位置、同一个按钮：不在库是「加入」，在库是「移出」（用户诉求：加了
       // 要能取消）。移出走书架同一条 deleteBook 路径，连已下载章节一起删。
@@ -1993,14 +2183,22 @@ class _MangaSeriesPageState extends ConsumerState<MangaSeriesPage> {
           label: t.mihon_add_to_bookshelf,
           onPressed: _busy ? null : () => unawaited(_addToLibrary()),
         ),
-      // 下载动作只对在库条目有意义：任务表按 bookKey 记，没有行就没地方挂任务。
-      if (inLibrary)
+      // 下载 / 批量删除下载：进入章节多选（勾选 + 全选 / 反选），确认时再决定动作。
+      // 任务表按 bookKey 记，只在在库时才有意义。
+      if (inLibrary) ...<Widget>[
         MediaDetailSecondaryButton(
-          buttonKey: const ValueKey<String>('manga_series_download_all'),
+          buttonKey: const ValueKey<String>('manga_series_download'),
           icon: FushiIcons.download,
-          label: t.manga_series_download_all,
-          onPressed: _busy ? null : () => unawaited(_downloadAll()),
+          label: t.manga_chapter_download_action,
+          onPressed: _busy ? null : () => _enterChapterSelection('download'),
         ),
+        MediaDetailSecondaryButton(
+          buttonKey: const ValueKey<String>('manga_series_batch_delete'),
+          icon: FushiIcons.delete,
+          label: t.manga_chapter_download_delete_action,
+          onPressed: _busy ? null : () => _enterChapterSelection('delete'),
+        ),
+      ],
       if (entry != null && inLibrary && _service != null)
         MediaDetailSecondaryButton(
           buttonKey: const ValueKey<String>('manga_series_subscribe'),
