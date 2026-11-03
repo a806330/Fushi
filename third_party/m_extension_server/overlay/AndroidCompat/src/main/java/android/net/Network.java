@@ -1,17 +1,12 @@
 package android.net;
 
 import java.net.Socket;
-import java.net.SocketFactory;
 import java.net.URL;
 import java.net.URLConnection;
 import java.io.IOException;
 
 public class Network {
     public Network() {}
-
-    public SocketFactory getSocketFactory() {
-        return null;
-    }
 
     public URLConnection openConnection(URL url) throws IOException {
         return null;
