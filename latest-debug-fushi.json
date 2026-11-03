@@ -1,20 +1,20 @@
 {
   "schemaVersion": 1,
-  "version": "3.0.1-debug.19839",
-  "tag": "v3.0.1-debug.19839+9684508",
+  "version": "3.0.1-debug.19840",
+  "tag": "v3.0.1-debug.19840+407df8d",
   "channel": "debug",
   "prerelease": true,
-  "releaseSequence": 19839,
-  "notes": "Manual desktop debug-channel build from feat/download-plaintext-export @ 9684508. Debug releases are prerelease and never Latest.",
+  "releaseSequence": 19840,
+  "notes": "Manual desktop debug-channel build from feat/download-plaintext-export @ 407df8d. Debug releases are prerelease and never Latest.",
   "assets": [
     {
-      "name": "fushi-3.0.1-debug.19839-windows-setup.exe",
-      "browser_download_url": "https://github.com/a806330/Fushi/releases/download/fushi-debug-rolling/fushi-3.0.1-debug.19839-windows-setup.exe",
-      "releaseSequence": 19839,
-      "tag": "v3.0.1-debug.19839+9684508",
-      "version": "3.0.1-debug.19839",
-      "size": 303133951,
-      "sha256": "21b9e6734f99c4481185197c1ab56ead9587a4a4886e53d611d4e9c1c217e212"
+      "name": "fushi-3.0.1-debug.19840-windows-setup.exe",
+      "browser_download_url": "https://github.com/a806330/Fushi/releases/download/fushi-debug-rolling/fushi-3.0.1-debug.19840-windows-setup.exe",
+      "releaseSequence": 19840,
+      "tag": "v3.0.1-debug.19840+407df8d",
+      "version": "3.0.1-debug.19840",
+      "size": 303152021,
+      "sha256": "6799327f217971b8ada8340fa3644087514fc064d793a8c1314ddd8a67cd5508"
     }
   ]
 }
