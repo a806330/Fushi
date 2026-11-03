@@ -641,12 +641,49 @@ class MangaDownloadService {
     }
   }
 
-  /// Windows / 各平台都安全的文件夹名：清掉非法字符与首尾空白，空名回退 `untitled`。
+  /// 单个路径段的最大字符数。Windows 全路径上限 260，`<root>\<作品名>\<章名>\<页名>`
+  /// 四段叠加、加上用户选的根目录本身很深时很容易超限；各平台文件名上限也普遍在
+  /// 255 字节。按 rune 截到 60 留足余量（rune 而非 code unit，避免切断 emoji/生僻字）。
+  static const int _maxSegmentRunes = 60;
+
+  /// Windows 保留设备名：`NUL` / `CON` / `COM1` 之类无法作为文件名创建，
+  /// 且不区分大小写（`nul.txt` 同样非法）。
+  static const Set<String> _windowsReserved = <String>{
+    'con', 'prn', 'aux', 'nul',
+    'com1', 'com2', 'com3', 'com4', 'com5', 'com6', 'com7', 'com8', 'com9',
+    'lpt1', 'lpt2', 'lpt3', 'lpt4', 'lpt5', 'lpt6', 'lpt7', 'lpt8', 'lpt9',
+  };
+
+  /// Windows / 各平台都安全的文件夹名：
+  /// ① 替换非法字符；② 去掉控制字符；③ 折叠空白并去首尾空白；④ 剥掉结尾的
+  /// `.` 与空格（Windows 会静默丢弃它们，导致实际目录名与预期不一致——之后
+  /// 删除/查找按预期名去找必然落空，留下永远删不掉的孤儿目录）；⑤ 截断过长名；
+  /// ⑥ 保留设备名加前缀；⑦ 空名回退 `untitled`。
   static String _safeName(String name) {
-    final String cleaned = name
-        .replaceAll(RegExp(r'[\\/:*?"<>|\r\n\t]'), '_')
+    String cleaned = name
+        .replaceAll(RegExp(r'[\\/:*?"<>|]'), '_')
+        .replaceAll(RegExp(r'[\x00-\x1F\x7F]'), '')
+        .replaceAll(RegExp(r'\s+'), ' ')
         .trim();
-    return cleaned.isEmpty ? 'untitled' : cleaned;
+    String stripTrailingDots(String value) {
+      while (value.isNotEmpty &&
+          (value.endsWith('.') || value.endsWith(' '))) {
+        value = value.substring(0, value.length - 1);
+      }
+      return value;
+    }
+
+    cleaned = stripTrailingDots(cleaned);
+    if (cleaned.runes.length > _maxSegmentRunes) {
+      cleaned = stripTrailingDots(
+        String.fromCharCodes(cleaned.runes.take(_maxSegmentRunes)),
+      );
+    }
+    if (cleaned.isEmpty) return 'untitled';
+    if (_windowsReserved.contains(cleaned.toLowerCase())) {
+      return '_$cleaned';
+    }
+    return cleaned;
   }
 
   /// 删所有已结束（done / failed / cancelled）的任务行（下载中心「清除已完成」）。
@@ -1089,11 +1126,16 @@ class MangaDownloadService {
     );
     // 「仅明文落盘」模式：把刚写好的内部章目录整体搬到用户所选明文根目录
     // `<root>/<作品名>/<章名>/`，并删内部副本——Fushi 自己不再留 hash 副本。
+    final String? exportRoot = _exportRoots[job.jobId];
     await _moveChapterToExport(job, chapterDir);
     final MangaDownloadJobRow? current = await _database.getMangaDownloadJob(
       job.jobId,
     );
     if (current == null || !current.autoOcr) return;
+    // 明文模式下内部章目录（含 manga.json）已随导出被删除：既没有 sidecar 可读，
+    // 也没有目录可供 OCR 钩子使用。此处直接返回，避免每次完成都抛一次
+    // `readAsString` 失败并刷错误日志（用户看到的是「已完成」却莫名有报错）。
+    if (exportRoot != null) return;
     try {
       final MokuroPayload existing = parseMangaJson(
         await mangaJson.readAsString(),
