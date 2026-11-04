@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/widgets.dart' show Opacity;
 import 'package:material_ui/material_ui.dart';
 
 import 'package:fushi/src/focus/fushi_focus_scroll.dart';
