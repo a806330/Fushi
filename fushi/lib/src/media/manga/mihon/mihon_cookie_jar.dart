@@ -30,6 +30,15 @@ const String kMihonCookieHeader = 'X-Fushi-Cookies';
 /// 查表，省掉一层大小写归一。（请求头由我们自己写，大小写不敏感。）
 const String kMihonSetCookieHeader = 'x-fushi-set-cookie';
 
+/// 宿主 → sidecar：Cloudflare 过盾时 WebView **实际使用**的 User-Agent。
+///
+/// `cf_clearance` 同时绑定 UA 与 IP：过盾页用 UA-A 拿到 cookie，sidecar 后续却用
+/// 扩展自设的 UA-B 去请求，Cloudflare 会原地再发一次挑战，表现为「验证完了还是
+/// 403、源始终打不开」。sidecar 的 `SourceCookieInjection` 早已预留
+/// `X-Fushi-Source-User-Agent` 并会 `setUA()`，只是宿主此前从不发这个头。
+/// 只在某站成功过盾后才带，其它源的请求头保持原样。
+const String kMihonSourceUserAgentHeader = 'X-Fushi-Source-User-Agent';
+
 /// 两个方向共用的载荷编解码：**base64(UTF-8 JSON 数组)**。
 ///
 /// 为什么套一层 base64：HTTP 头值只保证 ASCII 且不能含换行，而 cookie 值里出现
