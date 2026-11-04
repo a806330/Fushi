@@ -70,6 +70,10 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
   /// 所以宿主每次调用都要重新注入（BUG-2425）。
   final MihonCookieJar _cookies;
 
+  /// 站点成功过盾时 WebView 使用的 UA（host → UA）。与 `cf_clearance` 一起构成
+  /// 「浏览器身份」：两者必须原样交给 sidecar，否则 Cloudflare 会再次挑战。
+  final Map<String, String> _cloudflareUserAgents = <String, String>{};
+
   @override
   MihonCookieJar get cookieJar => _cookies;
 
@@ -118,12 +122,11 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
   /// 各不相同），按 baseUrl 筛会把只作用在登录子域上的会话 cookie 整个丢掉。域
   /// 匹配由 sidecar 那边的 okhttp jar 按每个实际请求 URL 去做。
   ///
-  /// 刻意**不设源的 UA**：本轮桌面端不做 Cloudflare 解题（sidecar 的
-  /// `CloudflareInterceptor` 是空壳），没有「clearance 绑定 UA」的约束，改写只会
-  /// 平白破坏自设 UA 的源。注意这条**只有在 sidecar 改成读专用头之后才成立**——
-  /// 在那之前，`dart:io` 无条件带上的 `User-Agent: Dart/x.y (dart:io)` 会被当成
-  /// 源的 UA 全局写下去。将来补解题时，UA 必须与 cookie 一起作为「登录身份」整体
-  /// 存取，而不是在这里单独塞一个默认值。
+  /// 绝不写标准的 `User-Agent:`：`dart:io` 无条件带 `Dart/x.y (dart:io)`，会被
+  /// 当成源的身份平白破坏自设 UA 的源。只在某站**成功过盾之后**，把 WebView 当时
+  /// 用的 UA 经专用头 [kMihonSourceUserAgentHeader] 交给 sidecar 的
+  /// `SourceCookieInjection.applyRequestUserAgent`，让 `cf_clearance` 与 UA 对齐；
+  /// 没过盾的源一个字节都不多带。
   Future<Map<String, String>> _headersFor(MihonSource? source) async {
     final Map<String, String> headers = _headers;
     final Uri? base = _sourceBaseUri(source);
@@ -133,7 +136,23 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     if (cookies.isNotEmpty) {
       headers[kMihonCookieHeader] = encodeMihonCookieWire(cookies);
     }
+    final String? verifiedUa = _verifiedUserAgentFor(base.host);
+    if (verifiedUa != null) {
+      headers[kMihonSourceUserAgentHeader] = verifiedUa;
+    }
     return headers;
+  }
+
+  /// 过盾页拿到的 URL 可能是子域（如 `api.xxx`），而源的 baseUrl 是主域：
+  /// 精确匹配优先，再退到「host 属于该站子域」。
+  String? _verifiedUserAgentFor(String host) {
+    final String? exact = _cloudflareUserAgents[host];
+    if (exact != null) return exact;
+    for (final MapEntry<String, String> entry
+        in _cloudflareUserAgents.entries) {
+      if (host.endsWith('.${entry.key}')) return entry.value;
+    }
+    return null;
   }
 
   /// 测试缝：直接跑生产的请求头构造，不必先把 JVM sidecar 拉起来。
@@ -203,6 +222,7 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
   /// 回来）：`cf_clearance` 绑定 UA，浏览器换个 UA 拿到的 cookie 交给 sidecar 会
   /// 被 Cloudflare 原地拒掉，表现为「验证完了还是 403」。写进的是同一个 jar 实例，
   /// 下一次调用 [_headersFor] 就会把新 cookie 注入 sidecar，不需要重启子进程。
+  /// 同时把这个 UA 记进 [_cloudflareUserAgents]，让后续源请求与过盾页保持同一身份。
   @override
   Future<void> solveCloudflare(Uri uri, {String? userAgent}) async {
     final MihonCloudflareResolver? resolver = MihonCloudflareGate.resolver;
@@ -212,12 +232,20 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
         'No browser is available to solve the verification',
       );
     }
-    final bool solved = await resolver(uri, userAgent ?? '', _cookies);
+    // WebView 用 effectiveUa 打开挑战页，拿到 cf_clearance；源请求必须继续用它，
+    // 否则 cookie 与 UA 不匹配，Cloudflare 会再抛一次挑战，MyComic 这类站点就
+    // 表现为「点了验证也没用、始终打不开」（实测 mycomic.com 返回
+    // `403 + Server: cloudflare + Cf-Mitigated: challenge`）。
+    final String effectiveUa = userAgent ?? '';
+    final bool solved = await resolver(uri, effectiveUa, _cookies);
     if (!solved) {
       throw const MihonRuntimeException(
         'CHALLENGE_CANCELLED',
         'Website verification was cancelled',
       );
+    }
+    if (effectiveUa.isNotEmpty && uri.host.isNotEmpty) {
+      _cloudflareUserAgents[uri.host] = effectiveUa;
     }
   }
 
@@ -367,6 +395,12 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     // 看到的就是「登出按了没反应」。
     final Uri? base = _sourceBaseUri(source);
     if (base != null) {
+      // 清源数据 = 清登录身份，过盾时记下的 UA 也要一起作废，否则下次请求仍会
+      // 带着旧挑战页的 UA 去配一份已被清掉的 cf_clearance。
+      _cloudflareUserAgents.removeWhere(
+        (String host, String _) =>
+            host == base.host || base.host.endsWith('.$host'),
+      );
       try {
         await _cookies.clearForHost(base.host);
       } on Object {
