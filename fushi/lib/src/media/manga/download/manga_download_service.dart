@@ -585,12 +585,30 @@ class MangaDownloadService {
     );
     try {
       if (await abs.exists()) await abs.delete(recursive: true);
+      // 删光一部作品的全部章节后，<root>/<作品名>/ 会变成永远没人管的空壳
+      // （用户实测：G:\漫画\坂本日常\ 章节目录没了、作品目录还在）。每删一章都
+      // 试一次清父目录，只有真空时才删，因此批量删除会在最后一章自动收掉。
+      await _pruneEmptyExportParent(abs.parent);
     } on Object catch (error, stack) {
       ErrorLogService.instance.log(
         'MangaDownloadService.deleteExport ${job.jobId}',
         error,
         stack,
       );
+    }
+  }
+
+  /// 只清「作品名」这一层的空目录，绝不往上递归到用户选的导出根目录；
+  /// 且必须确认目录里一个条目都没有才删，用户自己放进去的文件一律不动。
+  /// 清理属于收尾动作，目录被占用 / 权限不足时留空壳即可，不影响删除任务本身。
+  static Future<void> _pruneEmptyExportParent(Directory seriesDir) async {
+    try {
+      if (!await seriesDir.exists()) return;
+      if (await seriesDir.list().isEmpty) {
+        await seriesDir.delete(recursive: false);
+      }
+    } on Object catch (_) {
+      // 刻意吞掉：父目录清不掉不该让「删除章节」报错。
     }
   }
 
