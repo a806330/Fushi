@@ -33,6 +33,24 @@ class NetworkHelper(
             HostProxyPolicy
                 .configureClient(OkHttpClient.Builder())
                 .cookieJar(cookieJar)
+                .addInterceptor { chain ->
+                    val request = chain.request()
+                    val netStart = System.currentTimeMillis()
+                    try {
+                        val response = chain.proceed(request)
+                        System.err.println(
+                            "[Fushi][sidecar-net] t=$netStart ${request.method} ${request.url} " +
+                                "code=${response.code} ms=${System.currentTimeMillis() - netStart}",
+                        )
+                        response
+                    } catch (error: Throwable) {
+                        System.err.println(
+                            "[Fushi][sidecar-net] t=$netStart ${request.method} ${request.url} " +
+                                "err=${error.javaClass.simpleName} ms=${System.currentTimeMillis() - netStart}",
+                        )
+                        throw error
+                    }
+                }
                 .addInterceptor(UncaughtExceptionInterceptor())
                 .addInterceptor(UserAgentInterceptor(::defaultUserAgentProvider))
                 .addInterceptor(CloudflareInterceptor())
@@ -44,15 +62,36 @@ class NetworkHelper(
                     },
                 ).addInterceptor(BrotliInterceptor)
                 .connectTimeout(30, TimeUnit.SECONDS)
-                .readTimeout(30, TimeUnit.SECONDS)
+                // 关连接挂起已由 FastCloseSSLSocketFactory 独立压到 250ms（只影响 close，
+                // 不碰正常读取），所以这里可以放宽读取容忍：5s 曾误杀 mycomic 偶发的
+                // 慢响应（>5s 即 Read timed out → 重试耗尽 → 「加载失败」）。15s 兜住
+                // 实测最慢 ~10s 的响应，同时仍能及时暴露真死链。
+                .readTimeout(15, TimeUnit.SECONDS)
                 .callTimeout(2, TimeUnit.MINUTES)
+                .sslSocketFactory(
+                    FastCloseSSLSocketFactory(javax.net.ssl.SSLContext.getDefault().socketFactory),
+                    defaultTrustManager(),
+                )
                 .cache(
                     Cache(
                         directory = Files.createTempDirectory("m_network_cache").toFile(),
-                        maxSize = 5L * 1024 * 1024, // 5 MiB
+                        maxSize = 64L * 1024 * 1024, // 64 MiB：5MiB 会让二次访问大量 miss，重新走真实网络并再次触发关连接挂起
                     ),
                 )
         builder.build()
+    }
+
+    /**
+     * 系统 默认信任库 的 X509TrustManager，给 [FastCloseSSLSocketFactory] 配套。
+     * 信任行为与 JVM 默认完全一致（包括运行期被宿主注入的自定义 CA——那些走的是
+     * SSLContext.setDefault，getDefault() 会继承）。
+     */
+    private fun defaultTrustManager(): javax.net.ssl.X509TrustManager {
+        val factory = javax.net.ssl.TrustManagerFactory.getInstance(
+            javax.net.ssl.TrustManagerFactory.getDefaultAlgorithm(),
+        )
+        factory.init(null as java.security.KeyStore?)
+        return factory.trustManagers.filterIsInstance<javax.net.ssl.X509TrustManager>().first()
     }
 
     val cloudflareClient by lazy {
