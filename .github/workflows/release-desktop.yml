@@ -607,6 +607,16 @@ jobs:
             fushi/build/windows/x64/CMakeFiles/CMakeError.log
           if-no-files-found: ignore
           retention-days: 14
+      # 直改部署用：AOT 编译成功后立刻单独上传 data/app.so。后续 mihon runtime /
+      # Inno Setup 打包若因外部源 504 失败，也不影响取得这份 Dart 产物。
+      - name: Upload AOT app.so for direct patch
+        uses: actions/upload-artifact@v7
+        with:
+          name: fushi-aot-app-so
+          path: fushi/build/windows/x64/runner/Release/data/app.so
+          if-no-files-found: error
+          retention-days: 14
+
       # fushi_p2p 在 CMake 里是 copy-if-present（缺库只是运行期隐藏 P2P，不 brick），
       # 所以「编了却没进 bundle」不会让任何一步变红。这里把它钉成发布前的硬检查。
       - name: Verify fushi_p2p is in the Windows bundle
