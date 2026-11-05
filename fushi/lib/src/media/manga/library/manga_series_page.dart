@@ -451,12 +451,18 @@ class _MangaSeriesPageState extends ConsumerState<MangaSeriesPage> {
     return chapters.reversed.toList(growable: false);
   }
 
-  /// 多选态下这一章能不能选。「取消下载 / 批量删除下载」时，未下载且没有任务行的
-  /// 章没有任何本地内容可删，置灰不可选（勾上也是空删，还容易误以为删掉了）；
-  /// 「批量下载」时全部可选，已下载的由服务层跳过。
+  /// 多选态下这一章能不能选。
+  /// - 「取消下载 / 批量删除下载」时，未下载且没有任务行的章没有任何本地内容可删，
+  ///   置灰不可选（勾上也是空删，还容易误以为删掉了）。
+  /// - 「批量下载」时，已经进入下载列表的章（已下载 / 正下载 / 等待中）不可再选、
+  ///   置灰——否则点「全选」会把已下、在下的章也一次性勾上，重复入队或空操作，
+  ///   与删除改动保持一致（已在列表里的章不再参与批量选择）。
   bool _isChapterSelectable(OnlineMangaChapter chapter) {
-    if (_selectionIntent != 'delete') return true;
-    return _downloaded.contains(chapter.key) || _jobs.containsKey(chapter.key);
+    if (_selectionIntent == 'delete') {
+      return _downloaded.contains(chapter.key) || _jobs.containsKey(chapter.key);
+    }
+    // 下载意图：已在下载列表（已下载 / 排队中 / 执行中）的章不可选。
+    return !_downloaded.contains(chapter.key) && !_isChapterPending(chapter);
   }
 
   Future<void> _refreshDownloadState() async {
