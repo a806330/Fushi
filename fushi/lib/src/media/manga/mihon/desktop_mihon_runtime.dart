@@ -13,12 +13,15 @@ import 'package:fushi/src/media/manga/mihon/mihon_child_process_containment.dart
 import 'package:fushi/src/media/manga/mihon/mihon_cloudflare_gate.dart';
 import 'package:fushi/src/media/manga/cookie/manga_cookie_jar.dart';
 import 'package:fushi/src/media/manga/mihon/mihon_cookie_jar.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_cf_cert_manager.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_cf_webview2_fetch_proxy.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_cf_webview2_fetcher.dart';
 import 'package:fushi/src/media/manga/mihon/mihon_models.dart';
 import 'package:fushi/src/media/manga/mihon/mihon_runtime.dart';
 import 'package:fushi/src/media/manga/mihon/mihon_proxy_policy_server.dart';
 
-const Duration kMihonSourceImageHeaderTimeout = Duration(seconds: 90);
-const Duration kMihonSourceImageIdleTimeout = Duration(seconds: 90);
+const Duration kMihonSourceImageHeaderTimeout = Duration(seconds: 20);
+const Duration kMihonSourceImageIdleTimeout = Duration(seconds: 20);
 const int kMihonSourceImageMaxBytes = 32 * 1024 * 1024;
 
 /// 读取漫画源封面时按“无进度”计时，而不是从请求开始固定倒数。
@@ -84,6 +87,9 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
   Future<void>? _starting;
   bool _disposed = false;
   MihonProxyPolicyServer? _proxyPolicy;
+  // 内置 WebView2 代发（可选能力，默认关闭，见 _cfDelegationEnabled）。
+  MihonCfFetchProxy? _cfFetchProxy;
+  MihonCfCertManager? _cfCertManager;
   final Map<String, _CachedApk> _apkCache = <String, _CachedApk>{};
   final Map<String, http.Client> _imageClients = <String, http.Client>{};
   int _imageRequestSequence = 0;
@@ -134,13 +140,63 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     await _cookies.ensureLoadedBestEffort();
     final List<MangaCookie> cookies = _cookies.cookiesForSite(base.host);
     if (cookies.isNotEmpty) {
-      headers[kMihonCookieHeader] = encodeMihonCookieWire(cookies);
+      headers[kMihonCookieHeader] = encodeMihonCookieWire(
+        _cookiesWithinWireBudget(cookies),
+      );
     }
     final String? verifiedUa = _verifiedUserAgentFor(base.host);
     if (verifiedUa != null) {
       headers[kMihonSourceUserAgentHeader] = verifiedUa;
     }
     return headers;
+  }
+
+  /// NanoHTTPD 2.3.1 的请求头缓冲约 8KB。宿主每次把整站 cookie 用
+  /// [encodeMihonCookieWire] base64 后塞进 [kMihonCookieHeader]，站点登录态一多
+  /// （实测 mycomic 11 条 = 8804B）就撑爆缓冲，body 读取错位读到下一行请求，
+  /// Jackson 于是报 `Unrecognized token 'POST'` / 桥接请求失败。
+  ///
+  /// 这里按「凭证优先级 + 体积预算」裁剪：关键凭证（cf_clearance / 会话 / token）
+  /// 优先保留，超长的随机加密值最后；预算按 base64 后的 3000B 反推，留足余量。
+  /// cookie 少、没超预算的源一条都不丢；域匹配仍由 sidecar 的 okhttp jar 做。
+  static const int _kMaxCookieWireBytes = 3000;
+
+  static List<MangaCookie> _cookiesWithinWireBudget(
+    List<MangaCookie> cookies,
+  ) {
+    final List<MangaCookie> sorted = List<MangaCookie>.from(cookies);
+    sorted.sort(
+      (MangaCookie a, MangaCookie b) =>
+          _cookieRank(a).compareTo(_cookieRank(b)),
+    );
+    // base64 膨胀 4/3，再留 80B/条给 domain/path/secure 等线格式字段。
+    int budget = _kMaxCookieWireBytes * 3 ~/ 4;
+    final List<MangaCookie> kept = <MangaCookie>[];
+    for (final MangaCookie cookie in sorted) {
+      final int cost = cookie.name.length +
+          cookie.value.length +
+          cookie.domain.length +
+          80;
+      if (cost > budget && kept.isNotEmpty) continue;
+      kept.add(cookie);
+      budget -= cost;
+      if (budget <= 0) break;
+    }
+    return kept;
+  }
+
+  static int _cookieRank(MangaCookie cookie) {
+    final String name = cookie.name.toLowerCase();
+    if (name == 'cf_clearance') return 0;
+    if (name.contains('session') ||
+        name.contains('token') ||
+        name.contains('remember') ||
+        name.contains('uuid')) {
+      return 1;
+    }
+    // 800B+ 的随机名多为站点一次性加密负载，体积大且可省。
+    if (cookie.value.length > 512) return 4;
+    return 2;
   }
 
   /// 过盾页拿到的 URL 可能是子域（如 `api.xxx`），而源的 baseUrl 是主域：
@@ -472,6 +528,30 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     await log?.close();
     await _proxyPolicy?.close();
     _proxyPolicy = null;
+    // 代发 relay 是可选能力，回收失败不影响 sidecar 关停。
+    try {
+      await _cfFetchProxy?.stop();
+    } on Object {
+      // ignore
+    }
+    _cfFetchProxy = null;
+    _cfCertManager = null;
+  }
+
+  /// 内置 WebView2 代发开关。默认关闭：当前 mycomic 实际请求 api.copy4000.com，
+  /// 日志里没有 CF 挑战，启用代发只会把所有源拖慢。真遇到 CF 挑战时，在
+  /// <dataDirectory>/cf_delegation.json 写 {"enabled": true} 并重启即可打开。
+  Future<bool> _cfDelegationEnabled() async {
+    try {
+      final File config = File(
+        p.join(dataDirectory.path, 'cf_delegation.json'),
+      );
+      if (!await config.exists()) return false;
+      final Object? decoded = jsonDecode(await config.readAsString());
+      return decoded is Map && decoded['enabled'] == true;
+    } on Object {
+      return false;
+    }
   }
 
   Future<void> _ensureStarted() async {
@@ -515,8 +595,52 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
       List<int>.generate(32, (_) => random.nextInt(256)),
     ).replaceAll('=', '');
     await _proxyPolicy?.close();
+    // ---- 内置 WebView2 代发（默认关闭；开关见 _cfDelegationEnabled）----
+    // 全链路 best-effort：任一环节失败都不挂 trustStore、不指代理，等同现状。
+    try {
+      await _cfFetchProxy?.stop();
+    } on Object {
+      // ignore
+    }
+    _cfFetchProxy = null;
+    _cfCertManager = null;
+    int? cfRelayPort;
+    File? cfTrustStore;
+    if (await _cfDelegationEnabled()) {
+      try {
+        final MihonCfCertManager certManager = MihonCfCertManager(dataDirectory);
+        final MihonCfFetchProxy fetchProxy = MihonCfFetchProxy(
+          certManager: certManager,
+          fetcher: WebView2CfFetcher(),
+        );
+        cfRelayPort = await fetchProxy.start();
+        _cfFetchProxy = fetchProxy;
+        _cfCertManager = certManager;
+        cfTrustStore = await certManager.materializeMergedTrustStore(
+          keytool: _keytoolPath(),
+          runtimeCacerts: _runtimeCacertsPath(),
+        );
+      } on Object catch (error) {
+        debugPrint('[Fushi][mihon-cf] delegation init FAILED: $error');
+        cfRelayPort = null;
+        cfTrustStore = null;
+      }
+      if (cfTrustStore == null) {
+        try {
+          await _cfFetchProxy?.stop();
+        } on Object {
+          // ignore
+        }
+        _cfFetchProxy = null;
+        _cfCertManager = null;
+        cfRelayPort = null;
+      }
+    }
     final MihonProxyPolicyServer proxyPolicy =
-        await MihonProxyPolicyServer.start(token);
+        await MihonProxyPolicyServer.start(
+      token,
+      cfFetchProxyPort: cfRelayPort,
+    );
     _proxyPolicy = proxyPolicy;
     final Process process = await Process.start(
       java.path,
@@ -524,6 +648,12 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
         '-Xmx512m',
         '-Djava.awt.headless=true',
         '-Djava.util.prefs.userRoot=${preferences.path}',
+        if (cfTrustStore != null)
+          ...<String>[
+            '-Djavax.net.ssl.trustStore=${cfTrustStore!.path}',
+            '-Djavax.net.ssl.trustStoreType=PKCS12',
+            '-Djavax.net.ssl.trustStorePassword=changeit',
+          ],
         '-jar',
         server.path,
         // 0 = "bind an ephemeral port yourself and tell us which one".
@@ -872,6 +1002,36 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
       runtimeName,
       'bin',
       Platform.isWindows ? 'java.exe' : 'java',
+    );
+  }
+
+  /// 合并 CF 信任库用的 keytool（Fushi 自带 JVM 的 bin/keytool.exe）。
+  File _keytoolPath() {
+    final String runtimeName =
+        Platform.isMacOS ? 'runtime-macos-arm64' : 'runtime';
+    return File(
+      p.join(
+        resourceDirectory.path,
+        runtimeName,
+        'bin',
+        Platform.isWindows ? 'keytool.exe' : 'keytool',
+      ),
+    );
+  }
+
+  /// JVM 自带根证书库；合并它而不是系统 ca-bundle，才能保持 sidecar 对其它
+  /// 漫画源的信任集合不变。
+  File _runtimeCacertsPath() {
+    final String runtimeName =
+        Platform.isMacOS ? 'runtime-macos-arm64' : 'runtime';
+    return File(
+      p.join(
+        resourceDirectory.path,
+        runtimeName,
+        'lib',
+        'security',
+        'cacerts',
+      ),
     );
   }
 
