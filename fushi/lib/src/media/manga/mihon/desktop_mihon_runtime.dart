@@ -58,7 +58,7 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     MihonCookieJar? cookieJar,
   })  : resourceDirectory = resourceDirectory ?? _defaultResourceDirectory(),
         _processContainment = MihonChildProcessContainment.platform(),
-        _http = httpClient ?? http.Client(),
+        _http = httpClient ?? _NoKeepAliveClient(httpClient ?? http.Client()),
         _cookies = cookieJar ?? MihonCookieJar.shared;
 
   final Directory dataDirectory;
@@ -992,4 +992,26 @@ class _SidecarLogSink {
       // 关闭失败无所谓：进程已经退出，文件由 OS 收尾。
     }
   }
+}
+
+/// 包一层 [http.Client]，强制每条去往 M-Extension-Server（NanoHTTPD）的请求
+/// 关闭 keep-alive。
+///
+/// 根因：NanoHTTPD 在复用连接上读取第二个请求前，不会先把上一个请求的 body
+/// 从 socket 输入流消费掉，于是把「上一个 body + 下一个请求行」拼成非法 HTTP
+/// 动词（Unrecognized token 'POST' / M-Extension-Server request failed），连
+/// 「站点验证」入口都被堵死。让每条桥接请求都走新连接即可彻底绕开。
+class _NoKeepAliveClient extends http.BaseClient {
+  _NoKeepAliveClient(this._inner);
+
+  final http.Client _inner;
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) {
+    request.persistentConnection = false;
+    return _inner.send(request);
+  }
+
+  @override
+  void close() => _inner.close();
 }
