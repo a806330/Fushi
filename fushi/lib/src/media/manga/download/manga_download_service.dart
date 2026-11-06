@@ -44,6 +44,7 @@ import 'package:fushi/src/media/manga/mihon/manga_page_provider.dart';
 import 'package:fushi/src/media/manga/online/mokuro_moe_volume_downloader.dart';
 import 'package:fushi/src/platform/mobile/android_download_keep_alive.dart';
 import 'package:fushi/src/platform/mobile/download_keep_alive_hub.dart';
+import 'package:fushi/src/storage/app_paths.dart';
 import 'package:fushi/src/utils/misc/error_log_service.dart';
 import 'package:fushi_core/fushi_core.dart';
 import 'package:fushi_engine/media/manga/manga_storage.dart';
@@ -212,9 +213,54 @@ class MangaDownloadService {
   /// 任务是否处于「暂停」态（仅当次会话内有效）。
   bool isPaused(String jobId) => _pausedJobIds.contains(jobId);
 
-  /// 「仅明文落盘」模式的导出根目录映射：jobId → 用户所选根目录。内存态；跨进程重启
-  /// 后丢失（那时暂停/删除导出目录会退化为找不到——可接受，删任务行仍正常）。
+  /// 「仅明文落盘」模式的导出根目录映射：jobId → 用户所选根目录。仅当次进程有效，
+  /// 跨进程重启后的删除由 [_knownExportRoots] 的持久化清单兜底。
   final Map<String, String> _exportRoots = <String, String>{};
+
+  /// 用户用过的导出根目录清单，落在应用支持目录的
+  /// `mihon/manga_export_roots.json`。
+  ///
+  /// 起因：只靠内存 Map 时，用户下完漫画、关掉 Fushi、隔天回来删任务，映射已空，
+  /// `<root>/<作品名>/<章名>/` 就成了没人管的孤儿（实测 G:\漫画\坂本日常 删完
+  /// 任务仍留 2.4G）。删除时按「本次映射 + 历史根目录」双重定位即可跨重启清干净。
+  static const String _exportRootsFileName = 'manga_export_roots.json';
+  final Set<String> _knownExportRoots = <String>{};
+  bool _exportRootsLoaded = false;
+
+  static Future<File> _exportRootsFile() async {
+    final Directory supportRoot = await AppPaths.supportRootDirectory();
+    return File(p.join(supportRoot.path, 'mihon', _exportRootsFileName));
+  }
+
+  Future<void> _loadKnownExportRoots() async {
+    if (_exportRootsLoaded) return;
+    _exportRootsLoaded = true;
+    try {
+      final File file = await _exportRootsFile();
+      if (!await file.exists()) return;
+      final Object? decoded = jsonDecode(await file.readAsString());
+      if (decoded is List) {
+        for (final Object? item in decoded) {
+          if (item is String && item.isNotEmpty) _knownExportRoots.add(item);
+        }
+      }
+    } on Object catch (_) {
+      // 记录损坏就当没有历史根目录，不影响删任务行本身。
+    }
+  }
+
+  Future<void> _rememberExportRoot(String root) async {
+    await _loadKnownExportRoots();
+    if (!_knownExportRoots.add(root)) return;
+    try {
+      final File file = await _exportRootsFile();
+      await file.parent.create(recursive: true);
+      final List<String> sorted = _knownExportRoots.toList()..sort();
+      await file.writeAsString(jsonEncode(sorted), flush: true);
+    } on Object catch (_) {
+      // 落盘失败也要让下载继续：内存态仍在，本次会话内删除照样有效。
+    }
+  }
 
   /// 取任务的导出根目录（null = 非导出任务，走既有内部目录逻辑）。
   String? exportRootOf(String jobId) => _exportRoots[jobId];
@@ -432,6 +478,7 @@ class MangaDownloadService {
     required String root,
     required bool autoOcr,
   }) async {
+    await _rememberExportRoot(root);
     for (final OnlineMangaChapter chapter in chapters) {
       final MangaDownloadJobRow row = await enqueueChapter(
         entry: entry,
@@ -573,28 +620,37 @@ class MangaDownloadService {
     }
   }
 
-  /// 删除「仅明文落盘」模式下可能存在的明文导出目录（按 [_exportRoots] 查根目录后拼
-  /// `<root>/<作品名>/<章名>/`）。无根目录记录时静默跳过（与内部章目录删除互不影响）。
-  /// 跨进程重启后内存映射丢失，导出目录可能删不到——此时由用户手动清理，删任务行仍正常。
+  /// 删除「仅明文落盘」模式下可能存在的明文导出目录。
+  ///
+  /// 先用当次进程的精确映射 [_exportRoots]，再拿持久化的历史根目录清单兜底：
+  /// 关掉 Fushi 隔天回来删任务时映射已空，只有兜底才能把外部导出目录一起清掉。
+  /// 无根目录记录时静默跳过（与内部章目录删除互不影响）。
   Future<void> _deleteCleanExportIfAny(MangaDownloadJobRow job) async {
     if (job.kind != MangaDownloadJobKind.chapter) return;
-    final String? root = _exportRoots.remove(job.jobId);
-    if (root == null) return;
-    final Directory abs = Directory(
-      p.join(root, _safeName(job.title), _safeName(job.chapterTitle)),
-    );
-    try {
-      if (await abs.exists()) await abs.delete(recursive: true);
-      // 删光一部作品的全部章节后，<root>/<作品名>/ 会变成永远没人管的空壳
-      // （用户实测：G:\漫画\坂本日常\ 章节目录没了、作品目录还在）。每删一章都
-      // 试一次清父目录，只有真空时才删，因此批量删除会在最后一章自动收掉。
-      await _pruneEmptyExportParent(abs.parent);
-    } on Object catch (error, stack) {
-      ErrorLogService.instance.log(
-        'MangaDownloadService.deleteExport ${job.jobId}',
-        error,
-        stack,
-      );
+    final String? exactRoot = _exportRoots.remove(job.jobId);
+    await _loadKnownExportRoots();
+    final Set<String> roots = <String>{
+      if (exactRoot != null) exactRoot,
+      ..._knownExportRoots,
+    };
+    if (roots.isEmpty) return;
+    final String series = _safeName(job.title);
+    final String chapter = _safeName(job.chapterTitle);
+    for (final String root in roots) {
+      final Directory abs = Directory(p.join(root, series, chapter));
+      try {
+        if (!await abs.exists()) continue;
+        await abs.delete(recursive: true);
+        // 删光一部作品的全部章节后，<root>/<作品名>/ 会变成永远没人管的空壳。
+        // 每删一章都试一次清父目录，只有真空时才删，批量删除会在最后一章自动收掉。
+        await _pruneEmptyExportParent(abs.parent);
+      } on Object catch (error, stack) {
+        ErrorLogService.instance.log(
+          'MangaDownloadService.deleteExport ${job.jobId}',
+          error,
+          stack,
+        );
+      }
     }
   }
 
