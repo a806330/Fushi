@@ -26,6 +26,7 @@ library;
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
@@ -108,6 +109,14 @@ const List<Duration> kMangaDownloadRetryBackoff = <Duration>[
 /// 一个任务最多尝试的次数：失败后 `attempt_count < 3` 才退避重跑，否则 `failed`。
 const int kMangaDownloadMaxAttempts = 3;
 
+/// 同时执行的章节任务数。3 是「明显比串行快」与「不像爬虫」之间的折中：
+/// DB 的 claimNextQueuedMangaDownloadJob 在事务内原子领取，多 worker 不会抢同一条。
+const int kMangaDownloadChapterConcurrency = 3;
+
+/// 全局取页最小间隔；配合 [kMangaDownloadJitterMs] 的随机抖动打散节奏。
+const int kMangaDownloadMinIntervalMs = 60;
+const int kMangaDownloadJitterMs = 90;
+
 /// 分隔身份串的 NUL（写成转义而不是裸字节：裸 NUL 会让 git 把源码判成 binary）。
 final String _identitySeparator = String.fromCharCode(0);
 
@@ -166,6 +175,7 @@ class MangaDownloadService {
     Future<void> Function(Duration duration)? wait,
     DownloadKeepAlive? keepAlive,
     this.pageConcurrency = 4,
+    this.chapterConcurrency = kMangaDownloadChapterConcurrency,
   }) : _database = database,
        _serviceFor = serviceFor,
        _onChapterDownloaded = onChapterDownloaded,
@@ -189,8 +199,17 @@ class MangaDownloadService {
   final DownloadKeepAlive _keepAlive;
   bool _keepAliveActive = false;
 
-  /// 任务内同时在飞的取页数。
+  /// 任务内同时在飞的取页数（保持不变，避免单章请求过密）。
   final int pageConcurrency;
+
+  /// 同时执行的章节任务数（多任务下载）。
+  final int chapterConcurrency;
+
+  /// 全局发车节流：所有章节共享，控制对源站的总请求节奏。
+  final _DownloadThrottle _throttle = _DownloadThrottle(
+    minInterval: const Duration(milliseconds: kMangaDownloadMinIntervalMs),
+    maxJitter: const Duration(milliseconds: kMangaDownloadJitterMs),
+  );
 
   /// mokuro.moe 卷**真正新建书行**的累计数（书架据增量失效 provider 刷新列表；
   /// 已在库被 `DuplicatePolicy.skip()` 跳过的不计）。替代旧内存队列的
@@ -201,7 +220,8 @@ class MangaDownloadService {
   bool _disposed = false;
   bool _draining = false;
   bool _wakeRequested = false;
-  _ActiveJob? _active;
+  /// 在飞任务按 jobId 索引：多 worker 下 cancel/pause/delete 仍精确命中。
+  final Map<String, _ActiveJob> _activeJobs = <String, _ActiveJob>{};
   Completer<void>? _idle;
 
   /// 「暂停」态的任务（内存态，不落库）：数据库 status 仍记为 `cancelled`
@@ -292,8 +312,7 @@ class MangaDownloadService {
   /// 停止消费（正在飞的任务中止；行保持 `running`，下次 [start] 复位续跑）。
   void dispose() {
     _disposed = true;
-    final _ActiveJob? active = _active;
-    if (active != null) {
+    for (final _ActiveJob active in _activeJobs.values.toList()) {
       active.token.stopped = true;
       active.abort?.call();
     }
@@ -494,8 +513,8 @@ class MangaDownloadService {
   Future<void> cancel(String jobId) async {
     final MangaDownloadJobRow? row = await _database.getMangaDownloadJob(jobId);
     if (row == null) return;
-    final _ActiveJob? active = _active;
-    if (active != null && active.jobId == jobId) {
+    final _ActiveJob? active = _activeJobs[jobId];
+    if (active != null) {
       active.token.cancelled = true;
       active.abort?.call();
       return;
@@ -534,8 +553,8 @@ class MangaDownloadService {
   /// 删任务行（正在飞的先取消）。不删已下载的章目录——那是内容，走
   /// [deleteChapterDownload]。
   Future<void> remove(String jobId) async {
-    final _ActiveJob? active = _active;
-    if (active != null && active.jobId == jobId) {
+    final _ActiveJob? active = _activeJobs[jobId];
+    if (active != null) {
       active.token.cancelled = true;
       active.abort?.call();
       await active.done.future;
@@ -551,8 +570,8 @@ class MangaDownloadService {
   Future<void> pause(String jobId) async {
     final MangaDownloadJobRow? row = await _database.getMangaDownloadJob(jobId);
     if (row == null) return;
-    final _ActiveJob? active = _active;
-    if (active != null && active.jobId == jobId) {
+    final _ActiveJob? active = _activeJobs[jobId];
+    if (active != null) {
       // 正在飞：让执行体在捕获 [_Cancelled] 时保留章目录（cancelKeepFiles）。
       active.token.cancelled = true;
       active.token.cancelKeepFiles = true;
@@ -584,8 +603,8 @@ class MangaDownloadService {
   Future<void> deleteJob(String jobId, {required bool deleteFiles}) async {
     final MangaDownloadJobRow? row = await _database.getMangaDownloadJob(jobId);
     if (row == null) return;
-    final _ActiveJob? active = _active;
-    if (active != null && active.jobId == jobId) {
+    final _ActiveJob? active = _activeJobs[jobId];
+    if (active != null) {
       active.token.cancelled = true;
       active.abort?.call();
       await active.done.future;
@@ -790,27 +809,10 @@ class MangaDownloadService {
 
   Future<void> _drain() async {
     try {
-      while (!_disposed) {
-        final MangaDownloadJobRow? next = await _database
-            .claimNextQueuedMangaDownloadJob(updatedAt: _now);
-        if (next == null) break;
-        final _ActiveJob active = _ActiveJob(next.jobId);
-        _active = active;
-        _reportKeepAlive(next);
-        try {
-          await _run(next, active);
-        } on Object catch (error, stack) {
-          // _run 自己把失败落库；能到这里的是落库本身失败（库已关等）。
-          ErrorLogService.instance.log(
-            'MangaDownloadService.run ${next.jobId}',
-            error,
-            stack,
-          );
-        } finally {
-          _active = null;
-          active.done.complete();
-        }
-      }
+      final int lanes = chapterConcurrency < 1 ? 1 : chapterConcurrency;
+      await Future.wait<void>(<Future<void>>[
+        for (int i = 0; i < lanes; i++) _workerLoop(),
+      ]);
     } finally {
       _draining = false;
       final Completer<void>? idle = _idle;
@@ -823,6 +825,32 @@ class MangaDownloadService {
         _kick();
       } else {
         _stopKeepAlive();
+      }
+    }
+  }
+
+  /// 一条下载通道：不断从队列原子领取任务并执行，直到队列空或已 dispose。
+  /// 多条通道并行 = 多章节同时下载；每条通道内部仍由 _run 按页并发取图。
+  Future<void> _workerLoop() async {
+    while (!_disposed) {
+      final MangaDownloadJobRow? next = await _database
+          .claimNextQueuedMangaDownloadJob(updatedAt: _now);
+      if (next == null) return;
+      final _ActiveJob active = _ActiveJob(next.jobId);
+      _activeJobs[next.jobId] = active;
+      _reportKeepAlive(next);
+      try {
+        await _run(next, active);
+      } on Object catch (error, stack) {
+        // _run 自己把失败落库；能到这里的是落库本身失败（库已关等）。
+        ErrorLogService.instance.log(
+          'MangaDownloadService.run ${next.jobId}',
+          error,
+          stack,
+        );
+      } finally {
+        _activeJobs.remove(next.jobId);
+        active.done.complete();
       }
     }
   }
@@ -1256,6 +1284,9 @@ class MangaDownloadService {
     Directory images,
     int index,
   ) async {
+    // 多任务并发时统一排队发车：同域请求之间至少隔开最小间隔 + 随机抖动，
+    // 避免十几个请求同一瞬间打向源站被判为爬虫 / 触发限流封禁。
+    await _throttle.beforeRequest();
     final Uint8List bytes = await adapter.fetchChapterPage(page);
     if (bytes.isEmpty) {
       throw StateError('Empty page image at index $index');
@@ -1325,6 +1356,41 @@ class MangaDownloadService {
   static void _throwIfCancelled(_CancelToken token) {
     if (token.stopped) throw const _Stopped();
     if (token.cancelled) throw const _Cancelled();
+  }
+}
+
+/// 全局「发车闸门」：把并发取页的启动时刻排成一条带随机抖动的队，
+/// 保证任意两次请求之间有间隔，又不形成固定周期（固定周期同样是机器特征）。
+class _DownloadThrottle {
+  _DownloadThrottle({required this.minInterval, required this.maxJitter});
+
+  final Duration minInterval;
+  final Duration maxJitter;
+  final math.Random _random = math.Random();
+  Future<void> _tail = Future<void>.value();
+  DateTime? _lastStarted;
+
+  Future<void> beforeRequest() async {
+    final Future<void> previous = _tail;
+    final Completer<void> mine = Completer<void>();
+    _tail = mine.future;
+    await previous;
+    try {
+      final int jitterMs = maxJitter.inMilliseconds > 0
+          ? _random.nextInt(maxJitter.inMilliseconds)
+          : 0;
+      int waitMs = minInterval.inMilliseconds + jitterMs;
+      final DateTime? last = _lastStarted;
+      if (last != null) {
+        waitMs -= DateTime.now().difference(last).inMilliseconds;
+      }
+      if (waitMs > 0) {
+        await Future<void>.delayed(Duration(milliseconds: waitMs));
+      }
+      _lastStarted = DateTime.now();
+    } finally {
+      if (!mine.isCompleted) mine.complete();
+    }
   }
 }
 
