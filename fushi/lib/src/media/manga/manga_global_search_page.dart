@@ -53,7 +53,7 @@ class _MangaGlobalSearchPageState extends State<MangaGlobalSearchPage> {
   final TextEditingController _searchController = TextEditingController();
   final FocusNode _searchFocus = FocusNode();
   final MihonSourceImageLoadQueue _imageQueue = MihonSourceImageLoadQueue(
-    maxConcurrent: 4,
+    maxConcurrent: 8,
   );
 
   List<MangaSourceSearchRun> _runs = const <MangaSourceSearchRun>[];

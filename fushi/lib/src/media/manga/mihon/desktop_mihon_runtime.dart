@@ -13,12 +13,15 @@ import 'package:fushi/src/media/manga/mihon/mihon_child_process_containment.dart
 import 'package:fushi/src/media/manga/mihon/mihon_cloudflare_gate.dart';
 import 'package:fushi/src/media/manga/cookie/manga_cookie_jar.dart';
 import 'package:fushi/src/media/manga/mihon/mihon_cookie_jar.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_cf_cert_manager.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_cf_webview2_fetch_proxy.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_cf_webview2_fetcher.dart';
 import 'package:fushi/src/media/manga/mihon/mihon_models.dart';
 import 'package:fushi/src/media/manga/mihon/mihon_runtime.dart';
 import 'package:fushi/src/media/manga/mihon/mihon_proxy_policy_server.dart';
 
-const Duration kMihonSourceImageHeaderTimeout = Duration(seconds: 90);
-const Duration kMihonSourceImageIdleTimeout = Duration(seconds: 90);
+const Duration kMihonSourceImageHeaderTimeout = Duration(seconds: 20);
+const Duration kMihonSourceImageIdleTimeout = Duration(seconds: 20);
 const int kMihonSourceImageMaxBytes = 32 * 1024 * 1024;
 
 /// 读取漫画源封面时按“无进度”计时，而不是从请求开始固定倒数。
@@ -58,7 +61,7 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     MihonCookieJar? cookieJar,
   })  : resourceDirectory = resourceDirectory ?? _defaultResourceDirectory(),
         _processContainment = MihonChildProcessContainment.platform(),
-        _http = httpClient ?? http.Client(),
+        _http = httpClient ?? _NoKeepAliveClient(httpClient ?? http.Client()),
         _cookies = cookieJar ?? MihonCookieJar.shared;
 
   final Directory dataDirectory;
@@ -70,6 +73,10 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
   /// 所以宿主每次调用都要重新注入（BUG-2425）。
   final MihonCookieJar _cookies;
 
+  /// 站点成功过盾时 WebView 使用的 UA（host → UA）。与 `cf_clearance` 一起构成
+  /// 「浏览器身份」：两者必须原样交给 sidecar，否则 Cloudflare 会再次挑战。
+  final Map<String, String> _cloudflareUserAgents = <String, String>{};
+
   @override
   MihonCookieJar get cookieJar => _cookies;
 
@@ -80,6 +87,9 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
   Future<void>? _starting;
   bool _disposed = false;
   MihonProxyPolicyServer? _proxyPolicy;
+  // 内置 WebView2 代发（可选能力，默认关闭，见 _cfDelegationEnabled）。
+  MihonCfFetchProxy? _cfFetchProxy;
+  MihonCfCertManager? _cfCertManager;
   final Map<String, _CachedApk> _apkCache = <String, _CachedApk>{};
   final Map<String, http.Client> _imageClients = <String, http.Client>{};
   int _imageRequestSequence = 0;
@@ -118,12 +128,11 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
   /// 各不相同），按 baseUrl 筛会把只作用在登录子域上的会话 cookie 整个丢掉。域
   /// 匹配由 sidecar 那边的 okhttp jar 按每个实际请求 URL 去做。
   ///
-  /// 刻意**不设源的 UA**：本轮桌面端不做 Cloudflare 解题（sidecar 的
-  /// `CloudflareInterceptor` 是空壳），没有「clearance 绑定 UA」的约束，改写只会
-  /// 平白破坏自设 UA 的源。注意这条**只有在 sidecar 改成读专用头之后才成立**——
-  /// 在那之前，`dart:io` 无条件带上的 `User-Agent: Dart/x.y (dart:io)` 会被当成
-  /// 源的 UA 全局写下去。将来补解题时，UA 必须与 cookie 一起作为「登录身份」整体
-  /// 存取，而不是在这里单独塞一个默认值。
+  /// 绝不写标准的 `User-Agent:`：`dart:io` 无条件带 `Dart/x.y (dart:io)`，会被
+  /// 当成源的身份平白破坏自设 UA 的源。只在某站**成功过盾之后**，把 WebView 当时
+  /// 用的 UA 经专用头 [kMihonSourceUserAgentHeader] 交给 sidecar 的
+  /// `SourceCookieInjection.applyRequestUserAgent`，让 `cf_clearance` 与 UA 对齐；
+  /// 没过盾的源一个字节都不多带。
   Future<Map<String, String>> _headersFor(MihonSource? source) async {
     final Map<String, String> headers = _headers;
     final Uri? base = _sourceBaseUri(source);
@@ -131,9 +140,75 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     await _cookies.ensureLoadedBestEffort();
     final List<MangaCookie> cookies = _cookies.cookiesForSite(base.host);
     if (cookies.isNotEmpty) {
-      headers[kMihonCookieHeader] = encodeMihonCookieWire(cookies);
+      headers[kMihonCookieHeader] = encodeMihonCookieWire(
+        _cookiesWithinWireBudget(cookies),
+      );
+    }
+    final String? verifiedUa = _verifiedUserAgentFor(base.host);
+    if (verifiedUa != null) {
+      headers[kMihonSourceUserAgentHeader] = verifiedUa;
     }
     return headers;
+  }
+
+  /// NanoHTTPD 2.3.1 的请求头缓冲约 8KB。宿主每次把整站 cookie 用
+  /// [encodeMihonCookieWire] base64 后塞进 [kMihonCookieHeader]，站点登录态一多
+  /// （实测 mycomic 11 条 = 8804B）就撑爆缓冲，body 读取错位读到下一行请求，
+  /// Jackson 于是报 `Unrecognized token 'POST'` / 桥接请求失败。
+  ///
+  /// 这里按「凭证优先级 + 体积预算」裁剪：关键凭证（cf_clearance / 会话 / token）
+  /// 优先保留，超长的随机加密值最后；预算按 base64 后的 3000B 反推，留足余量。
+  /// cookie 少、没超预算的源一条都不丢；域匹配仍由 sidecar 的 okhttp jar 做。
+  static const int _kMaxCookieWireBytes = 3000;
+
+  static List<MangaCookie> _cookiesWithinWireBudget(
+    List<MangaCookie> cookies,
+  ) {
+    final List<MangaCookie> sorted = List<MangaCookie>.from(cookies);
+    sorted.sort(
+      (MangaCookie a, MangaCookie b) =>
+          _cookieRank(a).compareTo(_cookieRank(b)),
+    );
+    // base64 膨胀 4/3，再留 80B/条给 domain/path/secure 等线格式字段。
+    int budget = _kMaxCookieWireBytes * 3 ~/ 4;
+    final List<MangaCookie> kept = <MangaCookie>[];
+    for (final MangaCookie cookie in sorted) {
+      final int cost = cookie.name.length +
+          cookie.value.length +
+          cookie.domain.length +
+          80;
+      if (cost > budget && kept.isNotEmpty) continue;
+      kept.add(cookie);
+      budget -= cost;
+      if (budget <= 0) break;
+    }
+    return kept;
+  }
+
+  static int _cookieRank(MangaCookie cookie) {
+    final String name = cookie.name.toLowerCase();
+    if (name == 'cf_clearance') return 0;
+    if (name.contains('session') ||
+        name.contains('token') ||
+        name.contains('remember') ||
+        name.contains('uuid')) {
+      return 1;
+    }
+    // 800B+ 的随机名多为站点一次性加密负载，体积大且可省。
+    if (cookie.value.length > 512) return 4;
+    return 2;
+  }
+
+  /// 过盾页拿到的 URL 可能是子域（如 `api.xxx`），而源的 baseUrl 是主域：
+  /// 精确匹配优先，再退到「host 属于该站子域」。
+  String? _verifiedUserAgentFor(String host) {
+    final String? exact = _cloudflareUserAgents[host];
+    if (exact != null) return exact;
+    for (final MapEntry<String, String> entry
+        in _cloudflareUserAgents.entries) {
+      if (host.endsWith('.${entry.key}')) return entry.value;
+    }
+    return null;
   }
 
   /// 测试缝：直接跑生产的请求头构造，不必先把 JVM sidecar 拉起来。
@@ -203,6 +278,7 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
   /// 回来）：`cf_clearance` 绑定 UA，浏览器换个 UA 拿到的 cookie 交给 sidecar 会
   /// 被 Cloudflare 原地拒掉，表现为「验证完了还是 403」。写进的是同一个 jar 实例，
   /// 下一次调用 [_headersFor] 就会把新 cookie 注入 sidecar，不需要重启子进程。
+  /// 同时把这个 UA 记进 [_cloudflareUserAgents]，让后续源请求与过盾页保持同一身份。
   @override
   Future<void> solveCloudflare(Uri uri, {String? userAgent}) async {
     final MihonCloudflareResolver? resolver = MihonCloudflareGate.resolver;
@@ -212,12 +288,20 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
         'No browser is available to solve the verification',
       );
     }
-    final bool solved = await resolver(uri, userAgent ?? '', _cookies);
+    // WebView 用 effectiveUa 打开挑战页，拿到 cf_clearance；源请求必须继续用它，
+    // 否则 cookie 与 UA 不匹配，Cloudflare 会再抛一次挑战，MyComic 这类站点就
+    // 表现为「点了验证也没用、始终打不开」（实测 mycomic.com 返回
+    // `403 + Server: cloudflare + Cf-Mitigated: challenge`）。
+    final String effectiveUa = userAgent ?? '';
+    final bool solved = await resolver(uri, effectiveUa, _cookies);
     if (!solved) {
       throw const MihonRuntimeException(
         'CHALLENGE_CANCELLED',
         'Website verification was cancelled',
       );
+    }
+    if (effectiveUa.isNotEmpty && uri.host.isNotEmpty) {
+      _cloudflareUserAgents[uri.host] = effectiveUa;
     }
   }
 
@@ -367,6 +451,12 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     // 看到的就是「登出按了没反应」。
     final Uri? base = _sourceBaseUri(source);
     if (base != null) {
+      // 清源数据 = 清登录身份，过盾时记下的 UA 也要一起作废，否则下次请求仍会
+      // 带着旧挑战页的 UA 去配一份已被清掉的 cf_clearance。
+      _cloudflareUserAgents.removeWhere(
+        (String host, String _) =>
+            host == base.host || base.host.endsWith('.$host'),
+      );
       try {
         await _cookies.clearForHost(base.host);
       } on Object {
@@ -438,6 +528,30 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     await log?.close();
     await _proxyPolicy?.close();
     _proxyPolicy = null;
+    // 代发 relay 是可选能力，回收失败不影响 sidecar 关停。
+    try {
+      await _cfFetchProxy?.stop();
+    } on Object {
+      // ignore
+    }
+    _cfFetchProxy = null;
+    _cfCertManager = null;
+  }
+
+  /// 内置 WebView2 代发开关。默认关闭：当前 mycomic 实际请求 api.copy4000.com，
+  /// 日志里没有 CF 挑战，启用代发只会把所有源拖慢。真遇到 CF 挑战时，在
+  /// <dataDirectory>/cf_delegation.json 写 {"enabled": true} 并重启即可打开。
+  Future<bool> _cfDelegationEnabled() async {
+    try {
+      final File config = File(
+        p.join(dataDirectory.path, 'cf_delegation.json'),
+      );
+      if (!await config.exists()) return false;
+      final Object? decoded = jsonDecode(await config.readAsString());
+      return decoded is Map && decoded['enabled'] == true;
+    } on Object {
+      return false;
+    }
   }
 
   Future<void> _ensureStarted() async {
@@ -481,8 +595,52 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
       List<int>.generate(32, (_) => random.nextInt(256)),
     ).replaceAll('=', '');
     await _proxyPolicy?.close();
+    // ---- 内置 WebView2 代发（默认关闭；开关见 _cfDelegationEnabled）----
+    // 全链路 best-effort：任一环节失败都不挂 trustStore、不指代理，等同现状。
+    try {
+      await _cfFetchProxy?.stop();
+    } on Object {
+      // ignore
+    }
+    _cfFetchProxy = null;
+    _cfCertManager = null;
+    int? cfRelayPort;
+    File? cfTrustStore;
+    if (await _cfDelegationEnabled()) {
+      try {
+        final MihonCfCertManager certManager = MihonCfCertManager(dataDirectory);
+        final MihonCfFetchProxy fetchProxy = MihonCfFetchProxy(
+          certManager: certManager,
+          fetcher: WebView2CfFetcher(),
+        );
+        cfRelayPort = await fetchProxy.start();
+        _cfFetchProxy = fetchProxy;
+        _cfCertManager = certManager;
+        cfTrustStore = await certManager.materializeMergedTrustStore(
+          keytool: _keytoolPath(),
+          runtimeCacerts: _runtimeCacertsPath(),
+        );
+      } on Object catch (error) {
+        debugPrint('[Fushi][mihon-cf] delegation init FAILED: $error');
+        cfRelayPort = null;
+        cfTrustStore = null;
+      }
+      if (cfTrustStore == null) {
+        try {
+          await _cfFetchProxy?.stop();
+        } on Object {
+          // ignore
+        }
+        _cfFetchProxy = null;
+        _cfCertManager = null;
+        cfRelayPort = null;
+      }
+    }
     final MihonProxyPolicyServer proxyPolicy =
-        await MihonProxyPolicyServer.start(token);
+        await MihonProxyPolicyServer.start(
+      token,
+      cfFetchProxyPort: cfRelayPort,
+    );
     _proxyPolicy = proxyPolicy;
     final Process process = await Process.start(
       java.path,
@@ -490,6 +648,12 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
         '-Xmx512m',
         '-Djava.awt.headless=true',
         '-Djava.util.prefs.userRoot=${preferences.path}',
+        if (cfTrustStore != null)
+          ...<String>[
+            '-Djavax.net.ssl.trustStore=${cfTrustStore!.path}',
+            '-Djavax.net.ssl.trustStoreType=PKCS12',
+            '-Djavax.net.ssl.trustStorePassword=changeit',
+          ],
         '-jar',
         server.path,
         // 0 = "bind an ephemeral port yourself and tell us which one".
@@ -841,6 +1005,36 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     );
   }
 
+  /// 合并 CF 信任库用的 keytool（Fushi 自带 JVM 的 bin/keytool.exe）。
+  File _keytoolPath() {
+    final String runtimeName =
+        Platform.isMacOS ? 'runtime-macos-arm64' : 'runtime';
+    return File(
+      p.join(
+        resourceDirectory.path,
+        runtimeName,
+        'bin',
+        Platform.isWindows ? 'keytool.exe' : 'keytool',
+      ),
+    );
+  }
+
+  /// JVM 自带根证书库；合并它而不是系统 ca-bundle，才能保持 sidecar 对其它
+  /// 漫画源的信任集合不变。
+  File _runtimeCacertsPath() {
+    final String runtimeName =
+        Platform.isMacOS ? 'runtime-macos-arm64' : 'runtime';
+    return File(
+      p.join(
+        resourceDirectory.path,
+        runtimeName,
+        'lib',
+        'security',
+        'cacerts',
+      ),
+    );
+  }
+
   static Future<bool> _hasExited(Process process) async {
     try {
       await process.exitCode.timeout(const Duration(milliseconds: 1));
@@ -958,4 +1152,26 @@ class _SidecarLogSink {
       // 关闭失败无所谓：进程已经退出，文件由 OS 收尾。
     }
   }
+}
+
+/// 包一层 [http.Client]，强制每条去往 M-Extension-Server（NanoHTTPD）的请求
+/// 关闭 keep-alive。
+///
+/// 根因：NanoHTTPD 在复用连接上读取第二个请求前，不会先把上一个请求的 body
+/// 从 socket 输入流消费掉，于是把「上一个 body + 下一个请求行」拼成非法 HTTP
+/// 动词（Unrecognized token 'POST' / M-Extension-Server request failed），连
+/// 「站点验证」入口都被堵死。让每条桥接请求都走新连接即可彻底绕开。
+class _NoKeepAliveClient extends http.BaseClient {
+  _NoKeepAliveClient(this._inner);
+
+  final http.Client _inner;
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) {
+    request.persistentConnection = false;
+    return _inner.send(request);
+  }
+
+  @override
+  void close() => _inner.close();
 }

@@ -4,6 +4,7 @@ import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:fushi/src/utils/components/glass/fushi_icon.dart';
+import 'package:fushi/src/utils/fushi_icons.dart';
 import 'package:fushi_core/fushi_core.dart';
 import 'package:fushi/src/media/downloads/download_source_method.dart';
 import 'package:fushi/src/media/downloads/download_task_card.dart';
@@ -125,9 +126,46 @@ DownloadTaskEntry mangaDownloadTaskEntry(
           : null;
   final String? seriesName = mokuroMoeSeriesNameOf(job.bookKey);
   final String collectionTitle = seriesName ?? job.title;
-  final String status = _statusLabel(job);
+  // 暂停态不落库（数据库 status 的 CHECK 不允许 `paused`），靠服务的 [_pausedJobIds]
+  // 内存集合在当次会话内区分「暂停」与「真取消」。
+  final bool paused = downloads.isPaused(job.jobId);
+  final String status = _statusLabel(job, paused);
   final ({DownloadTransferMethod method, bool external}) source =
       mangaDownloadSourceOf(job.runtime);
+  final DownloadTaskStatus entryStatus = switch (job.status) {
+    MangaDownloadJobStatus.queued => DownloadTaskStatus.queued,
+    MangaDownloadJobStatus.running => DownloadTaskStatus.active,
+    MangaDownloadJobStatus.done => DownloadTaskStatus.completed,
+    MangaDownloadJobStatus.failed => DownloadTaskStatus.attention,
+    _ => paused ? DownloadTaskStatus.paused : DownloadTaskStatus.cancelled,
+  };
+  // 行尾圆形快捷钮：下载中/排队给「暂停」（保留文件）、已暂停给「继续」、失败/已取消
+  // 给「重试」/「继续」。
+  final DownloadTaskQuickAction? quickAction = switch (job.status) {
+    MangaDownloadJobStatus.queued || MangaDownloadJobStatus.running =>
+      DownloadTaskQuickAction(
+        icon: FushiIcons.pause,
+        tooltip: t.download_task_pause,
+        onPressed: () => unawaited(downloads.pause(job.jobId)),
+      ),
+    MangaDownloadJobStatus.failed => DownloadTaskQuickAction(
+        icon: FushiIcons.refresh,
+        tooltip: t.retry,
+        onPressed: () => unawaited(downloads.retry(job.jobId)),
+      ),
+    MangaDownloadJobStatus.cancelled => paused
+        ? DownloadTaskQuickAction(
+            icon: FushiIcons.play,
+            tooltip: t.download_task_resume,
+            onPressed: () => unawaited(downloads.resume(job.jobId)),
+          )
+        : DownloadTaskQuickAction(
+            icon: FushiIcons.refresh,
+            tooltip: t.retry,
+            onPressed: () => unawaited(downloads.retry(job.jobId)),
+          ),
+    _ => null,
+  };
   return DownloadTaskEntry(
     id: id,
     title: job.kind == MangaDownloadJobKind.mokuroVolume
@@ -135,23 +173,29 @@ DownloadTaskEntry mangaDownloadTaskEntry(
         : '${job.title} · ${job.chapterTitle}',
     createdAt: job.createdAt,
     kind: DownloadTaskKind.manga,
-    status: switch (job.status) {
-      MangaDownloadJobStatus.queued => DownloadTaskStatus.queued,
-      MangaDownloadJobStatus.running => DownloadTaskStatus.active,
-      MangaDownloadJobStatus.done => DownloadTaskStatus.completed,
-      MangaDownloadJobStatus.failed => DownloadTaskStatus.attention,
-      _ => DownloadTaskStatus.cancelled,
-    },
+    status: entryStatus,
     progress: progress,
     collectionKey: job.bookKey,
     collectionTitle: collectionTitle,
     searchTerms: <String>[job.title, job.chapterTitle, collectionTitle],
-    // 单跑道持久队列：没有调度优先级、没有暂停态（cancel 后 retry 是同一行
-    // 重跑），任务上也没有可 reveal 的落盘路径。
+    // 漫画下载是单跑道持久队列：早期没有暂停态，现补充 pause / resume（保留已落地
+    // 页原地续跑）与 delete（删任务行 + 已下载内容）；cancel 仍是「放弃并删半成品」。
     actions: DownloadTaskActions(
       retry: retryable ? () => downloads.retry(job.jobId) : null,
       clear: finished ? () => downloads.remove(job.jobId) : null,
-      cancel: finished ? null : () => downloads.cancel(job.jobId),
+      cancel: finished
+          ? null
+          : () => downloads.cancel(job.jobId),
+      pause: (job.status == MangaDownloadJobStatus.queued ||
+              job.status == MangaDownloadJobStatus.running)
+          ? () => downloads.pause(job.jobId)
+          : null,
+      resume: (job.status == MangaDownloadJobStatus.cancelled && paused)
+          ? () => downloads.resume(job.jobId)
+          : null,
+      delete: ({required bool deleteFiles}) =>
+          downloads.deleteJob(job.jobId, deleteFiles: deleteFiles),
+      deletesFiles: true,
     ),
     builder: (BuildContext context) => DownloadTaskCard(
       key: ValueKey<String>(id),
@@ -164,6 +208,7 @@ DownloadTaskEntry mangaDownloadTaskEntry(
       status: status,
       subtitle: collectionTitle,
       progress: progress,
+      quickAction: quickAction,
       details: _MangaDownloadTaskRow(
         job: job,
         status: status,
@@ -196,7 +241,10 @@ bool _isFinished(MangaDownloadJobRow job) =>
     job.status == MangaDownloadJobStatus.failed ||
     job.status == MangaDownloadJobStatus.cancelled;
 
-String _statusLabel(MangaDownloadJobRow job) => switch (job.status) {
+String _statusLabel(MangaDownloadJobRow job, bool paused) {
+  // 暂停态复用 cancelled 状态，靠 paused 标记区分；此处给明确的「已暂停」文案。
+  if (paused) return '已暂停';
+  return switch (job.status) {
       MangaDownloadJobStatus.queued => t.download_status_queued,
       MangaDownloadJobStatus.running => job.pagesTotal > 0
           ? t.manga_ocr_wizard_page_progress(
@@ -213,6 +261,7 @@ String _statusLabel(MangaDownloadJobRow job) => switch (job.status) {
       // 共用同一个失败文案拼法。
       _ => mangaChapterDownloadFailedLabel(job.lastError),
     };
+}
 
 /// 卡片展开后的详情行：状态图标 + 标题 + 状态文案 + 行内动作。
 class _MangaDownloadTaskRow extends StatelessWidget {
@@ -264,6 +313,7 @@ class _MangaDownloadTaskRow extends StatelessWidget {
             ),
     };
     final bool errorTone = job.status == MangaDownloadJobStatus.failed;
+    final bool paused = downloads.isPaused(job.jobId);
     final bool retryable = job.status == MangaDownloadJobStatus.failed ||
         job.status == MangaDownloadJobStatus.cancelled;
     return FushiListItem(
@@ -287,20 +337,24 @@ class _MangaDownloadTaskRow extends StatelessWidget {
       ),
       trailing: retryable
           ? FushiIconButton(
-              tooltip: t.retry,
-              icon: Icons.refresh,
+              tooltip: paused ? t.download_task_resume : t.retry,
+              icon: paused ? Icons.play_arrow : Icons.refresh,
               size: 20,
               constraints: _actionTarget,
-              onTap: () => unawaited(downloads.retry(job.jobId)),
+              onTap: () => unawaited(
+                paused
+                    ? downloads.resume(job.jobId)
+                    : downloads.retry(job.jobId),
+              ),
             )
           : job.status == MangaDownloadJobStatus.done
               ? null
               : FushiIconButton(
-                  tooltip: t.dialog_cancel,
-                  icon: Icons.close,
+                  tooltip: t.download_task_pause,
+                  icon: Icons.pause,
                   size: 20,
                   constraints: _actionTarget,
-                  onTap: () => unawaited(downloads.cancel(job.jobId)),
+                  onTap: () => unawaited(downloads.pause(job.jobId)),
                 ),
     );
   }

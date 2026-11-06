@@ -95,8 +95,11 @@ class _MihonCatalog extends OnlineSourceCatalog<MihonCatalogueEntry> {
 
   final MihonManager manager;
   final MihonBrowseTarget target;
+  // 列表一屏常有 8~12 张封面；4 路闸门让后面的封面排队等前面的 TLS 握手结束，
+  // 在「每请求都新建连接」的 sidecar 下尤其明显。提到 8 路，仍是单源可承受的
+  // 温和并发（不是无上限并发打爆站点），30s 队列超时与失败退避保持不变。
   final MihonSourceImageLoadQueue _imageLoadQueue = MihonSourceImageLoadQueue(
-    maxConcurrent: 4,
+    maxConcurrent: 8,
   );
   MihonSourceContext? _sourceContext;
   List<MihonFilter> _filters = const <MihonFilter>[];
