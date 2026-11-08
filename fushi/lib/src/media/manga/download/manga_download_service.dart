@@ -774,6 +774,32 @@ class MangaDownloadService {
     }
   }
 
+  /// 某章明文导出后所在的目录（跨重启靠持久化根目录清单兜底）。
+  /// 供作品页「在文件管理器中显示」定位：只查目录是否存在，不改动任何内容。
+  Future<List<String>> exportChapterDirectories(
+    MangaDownloadJobRow job,
+  ) async {
+    if (job.kind != MangaDownloadJobKind.chapter) return const <String>[];
+    await _loadKnownExportRoots();
+    final String? exactRoot = _exportRoots[job.jobId];
+    final Set<String> roots = <String>{
+      if (exactRoot != null) exactRoot,
+      ..._knownExportRoots,
+    };
+    final List<String> result = <String>[];
+    for (final String root in roots) {
+      final Directory dir = Directory(
+        p.join(root, _safeName(job.title), _safeName(job.chapterTitle)),
+      );
+      try {
+        if (await dir.exists()) result.add(dir.path);
+      } on Object catch (_) {
+        // 根目录可能已移走 / 无权限，跳过即可。
+      }
+    }
+    return result;
+  }
+
   /// 只清「作品名」这一层的空目录，绝不往上递归到用户选的导出根目录；
   /// 且必须确认目录里一个条目都没有才删，用户自己放进去的文件一律不动。
   /// 清理属于收尾动作，目录被占用 / 权限不足时留空壳即可，不影响删除任务本身。
