@@ -1,0 +1,138 @@
+name: Build Windows AOT (app.so + mihon_bridge)
+
+# Slim CI that produces the two artifacts needed to hot-swap into an EXISTING
+# local Fushi install (which already carries every native DLL, the patched
+# flutter_windows.dll, and the bundled JRE). We only rebuild:
+#   1. app.so            — the Dart AOT snapshot (carries the CF bypass + WNACG
+#                          multi-route injection framework)
+#   2. mihon_bridge      — the Mihon desktop sidecar (carries the CF TLS/image
+#                          proxy wiring in the Kotlin overlay)
+#
+# This deliberately does NOT build the self-contained installer or publish
+# anything. The Release CMake guards for the vcpkg-built libtorrent and pdfium
+# have been downgraded to WARNINGs in fushi/windows/CMakeLists.txt on this
+# branch, because those libraries already ship in the local install and are not
+# part of what we replace.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/download-plaintext-export
+
+concurrency:
+  group: windows-aot-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-aot:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Flutter 3.47.6
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.6'
+          cache: false
+          pub-cache: true
+
+      - name: Restore pdfium hook cache
+        uses: ./.github/actions/pdfium-hook-cache
+        with:
+          purpose: windows
+
+      - name: Apply patched Flutter engine (HDR overlay)
+        uses: ./.github/actions/flutter-engine-overlay
+
+      # BUG-1589: gen_snapshot.exe (AOT compiler) needs a larger stack reserve or
+      # the release AOT build crashes with a stack overflow. The local SDK is
+      # patched with editbin; a fresh CI SDK is not, so patch it here.
+      - name: Raise gen_snapshot stack reserve (BUG-1589)
+        shell: pwsh
+        run: |
+          flutter precache --windows
+          if ($LASTEXITCODE -ne 0) { throw 'flutter precache failed' }
+          $editbin = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\HostX64\x64\editbin.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $editbin) { throw 'editbin.exe not found in the VS 2022 toolchain' }
+          $snapshots = Get-ChildItem "$env:FLUTTER_ROOT\bin\cache\artifacts\engine" -Recurse -Filter gen_snapshot.exe
+          if (-not $snapshots) { throw 'gen_snapshot.exe not found under engine artifacts' }
+          foreach ($snap in $snapshots) {
+            & $editbin.FullName /STACK:134217728 $snap.FullName
+            if ($LASTEXITCODE -ne 0) { throw "editbin failed on $($snap.FullName)" }
+            Write-Host "Raised stack reserve to 128MB: $($snap.FullName)"
+          }
+
+      - name: flutter pub get
+        working-directory: fushi
+        run: flutter pub get
+
+      # 复刻上游 release-desktop.yml 的 windows job：pub get 之后必须打 pub-cache
+      # 补丁，否则 kernel 编译直接失败。ci/apply-patches.sh 会把
+      # ci/patches/hosted/<pkg>-<ver>/ 与 ci/patches/git/ 下的源文件覆盖进
+      # pub-cache，并给 Flutter framework 打 flutter-sdk 补丁（都编进 app.so）。
+      # 其中 dartssh2-2.11.0、pdfrx_engine-0.4.4 两个补丁正是修 Dart 3.13 收紧
+      # 「闭包捕获可空变量跨 await 的类型提升」后的编译错误（各加一个 ! 非空断言），
+      # 详见 ci/patches/hosted/*/FUSHI_PATCH.md。注：这些包不能靠升版本解决——
+      # dartssh2 2.15+ 要 pointycastle ^4、pdfrx_engine 0.4.6+ 要 archive ^4 /
+      # image ^4.8，都会引发全仓主版本迁移，故上游选择锁版本 + 打补丁。
+      - name: Apply pub cache patches
+        shell: bash
+        run: |
+          echo "PUB_CACHE=${PUB_CACHE:-<unset>}"
+          chmod +x ci/apply-patches.sh
+          bash ci/apply-patches.sh
+
+      - name: Build Windows release (app.so)
+        working-directory: fushi
+        run: flutter build windows --release
+
+      # The Mihon sidecar is built separately and dropped into the Release bundle
+      # after the Flutter build. Its gradle step runs :server:test, which compiles
+      # and unit-tests the CF Kotlin overlay, so a broken sidecar fails here (and
+      # is non-fatal to the app.so artifact thanks to continue-on-error).
+      - name: Build Mihon desktop runtime
+        id: mihon
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $built = "$env:RUNNER_TEMP\mihon-runtime"
+          .\tool\mihon\build_desktop_runtime.ps1 -OutputDirectory $built -DownloadCache "$env:RUNNER_TEMP\fushi-mihon-downloads"
+          if ($LASTEXITCODE -ne 0) { throw "Mihon desktop runtime build failed ($LASTEXITCODE)" }
+          $runtime = "fushi\build\windows\x64\runner\Release\mihon_bridge"
+          if (Test-Path -LiteralPath $runtime) { Remove-Item -LiteralPath $runtime -Recurse -Force }
+          Copy-Item -LiteralPath $built -Destination $runtime -Recurse
+          .\tool\mihon\verify_desktop_runtime.ps1 -RuntimeDirectory $runtime
+
+      - name: Upload app.so
+        if: success() || failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: app-so
+          path: fushi/build/windows/x64/runner/Release/data/app.so
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload mihon_bridge
+        if: steps.mihon.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: mihon-bridge
+          path: fushi/build/windows/x64/runner/Release/mihon_bridge
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Windows build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-aot-build-logs
+          path: |
+            fushi/build/windows/x64/CMakeFiles/CMakeOutput.log
+            fushi/build/windows/x64/CMakeFiles/CMakeError.log
+          if-no-files-found: ignore
+          retention-days: 7

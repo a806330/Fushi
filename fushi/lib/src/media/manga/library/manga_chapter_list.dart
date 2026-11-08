@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/widgets.dart' show Opacity;
 import 'package:material_ui/material_ui.dart';
 
 import 'package:fushi/src/focus/fushi_focus_scroll.dart';
@@ -75,6 +76,14 @@ class MangaChapterList extends StatelessWidget {
     this.ocrQueuedChapterKeys = const <String>{},
     this.languageScope,
     this.onSiblingSourceTap,
+    // 多选：批量下载 / 批量删除下载入口开启；开启后每行显示选择标记（复用
+    // [MediaDetailItemRow.selected]），点按整行切换选中，行尾菜单收起以免冲突。
+    this.selectionMode = false,
+    this.selectedChapterKeys = const <String>{},
+    this.selectionEnabled,
+    this.onToggleSelect,
+    this.onSelectAll,
+    this.onInvertSelection,
   });
 
   final OnlineMangaLibraryEntry? entry;
@@ -130,6 +139,26 @@ class MangaChapterList extends StatelessWidget {
   final OnlineMangaSourceLanguageScope? languageScope;
   final void Function(OnlineMangaSiblingSource sibling)? onSiblingSourceTap;
 
+  /// 多选模式开关。true 时每行按 [selectedChapterKeys] 显示选择标记，点按整行
+  /// 切换选中（见 [onToggleSelect]），行尾溢出菜单被隐藏。
+  final bool selectionMode;
+
+  /// 多选模式下已选中的章节 key 集合（来源是宿主持有的状态）。
+  final Set<String> selectedChapterKeys;
+
+  /// 多选模式下这一行能不能被选中；返回 false 的行置灰且不吃点击。
+  /// null（默认）= 全部可选，保持其它宿主（阅读器章节抽屉）的原行为。
+  /// 判据由宿主持有：批量删除下载时只有已下载 / 有任务行的章才有东西可删。
+  final bool Function(OnlineMangaChapter chapter)? selectionEnabled;
+
+  /// 多选模式下点按某章：切换其选中态。null = 不响应（宿主未接，理论不应出现）。
+  final void Function(OnlineMangaChapter chapter)? onToggleSelect;
+
+  /// 「全选」「反选」：作用于当前可见章节（与列表渲染一致的筛选 / 排序结果）。
+  /// null = 不出现对应按钮（非多选模式或宿主未接）。
+  final VoidCallback? onSelectAll;
+  final VoidCallback? onInvertSelection;
+
   /// 一章的下载状态：磁盘判据优先（真正决定能不能读），其次看任务行。
   _ChapterDownloadState _downloadStateOf(OnlineMangaChapter chapter) {
     if (downloadedChapterKeys.contains(chapter.key)) {
@@ -173,7 +202,16 @@ class MangaChapterList extends StatelessWidget {
     );
   }
 
-  List<OnlineMangaChapter> _visibleChapters(List<OnlineMangaChapter> chapters) {
+  /// 当前可见章节：与渲染一致的筛选（只看未读）+ 排序（新→旧反转）结果。
+  /// 抽成静态，供宿主在「全选 / 反选」时直接复用，避免两边各写一份漂移。
+  static List<OnlineMangaChapter> visibleChaptersOf(
+    OnlineMangaLibraryEntry? entry,
+    bool unreadOnly,
+    bool newestFirst,
+    Map<String, MangaChapterStateRow> states,
+  ) {
+    final List<OnlineMangaChapter> chapters =
+        entry?.chapters ?? const <OnlineMangaChapter>[];
     final Iterable<OnlineMangaChapter> filtered = unreadOnly
         ? chapters.where(
             (OnlineMangaChapter chapter) => states[chapter.key]?.readAt == null,
@@ -184,13 +222,17 @@ class MangaChapterList extends StatelessWidget {
     return ordered.reversed.toList(growable: false);
   }
 
-  /// 区块标题：「章节」+ 计数胶囊，行尾排序与只看未读。
+  List<OnlineMangaChapter> _visibleChapters(List<OnlineMangaChapter> chapters) =>
+      visibleChaptersOf(entry, unreadOnly, newestFirst, states);
+
+  /// 区块标题：「章节」+ 计数胶囊，行尾排序与只看未读；多选模式下换成「全选 /
+  /// 反选」。
   Widget _buildHeader(BuildContext context, int total) {
     return MediaDetailSectionHeader(
       t.mihon_chapters_title,
       count: total,
       padding: const EdgeInsets.fromLTRB(0, 16, 0, 8),
-      trailing: Row(
+      trailing: selectionMode ? _buildSelectionHeaderActions() : Row(
         mainAxisSize: MainAxisSize.min,
         children: <Widget>[
           // 纯图标省出标题位：几百话的作品标题行本来就挤（计数胶囊 + 只看未读），
@@ -227,6 +269,29 @@ class MangaChapterList extends StatelessWidget {
           ],
         ],
       ),
+    );
+  }
+
+  /// 多选模式下的区块标题行尾：全选 / 反选（作用当前可见章节）。
+  Widget _buildSelectionHeaderActions() {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        if (onSelectAll != null)
+          FushiActionChipControl(
+            key: const ValueKey<String>('manga_chapter_select_all'),
+            label: const Text('全选'),
+            onPressed: onSelectAll,
+          ),
+        if (onInvertSelection != null) ...<Widget>[
+          const SizedBox(width: 8),
+          FushiActionChipControl(
+            key: const ValueKey<String>('manga_chapter_invert_selection'),
+            label: const Text('反选'),
+            onPressed: onInvertSelection,
+          ),
+        ],
+      ],
     );
   }
 
@@ -302,10 +367,17 @@ class MangaChapterList extends StatelessWidget {
     final _ChapterDownloadState download = _downloadStateOf(chapter);
     final MangaDownloadJobRow? job = jobsByChapterKey[chapter.key];
     final int pagesTotal = job?.pagesTotal ?? 0;
+    // 多选：整行显示选中标记、点按切换选中，行尾菜单收起。宿主判为不可选的章
+    // （例如「取消下载」里的未下载章）置灰、不吃点击，也不显示成已勾选。
+    final bool selectable =
+        !selectionMode || selectionEnabled?.call(chapter) != false;
+    final bool selected = selectionMode &&
+        selectable &&
+        selectedChapterKeys.contains(chapter.key);
     // 相邻章节常有相同下载状态，列表身份必须取章节 key；状态探针放在每章内部，
     // 避免重复 sibling key，且排序 / 下载状态变化时保留该章的进场状态。
     final GlobalKey? anchor = current ? currentChapterAnchorKey : null;
-    return FushiStaggeredEntrance(
+    final Widget listRow = FushiStaggeredEntrance(
       key: ValueKey<String>('manga_chapter_${chapter.key}'),
       index: index,
       child: KeyedSubtree(
@@ -338,12 +410,26 @@ class MangaChapterList extends StatelessWidget {
                 download == _ChapterDownloadState.downloading && pagesTotal > 0
                 ? ((job?.pagesDone ?? 0) / pagesTotal).clamp(0.0, 1.0)
                 : null,
-            trailing: _buildMenu(chapter, download),
-            onTap: () => onChapterTap(chapter),
+            // [MediaDetailItemRow] 的 selected 为 null 时不画选择标记；非多选模式
+            // 下我们恒传 null，保持原行为。
+            selected: selectionMode ? selected : null,
+            trailing: selectionMode ? null : _buildMenu(chapter, download),
+            onTap: selectionMode
+                ? (selectable
+                    ? () {
+                        onToggleSelect?.call(chapter);
+                      }
+                    : null)
+                : () => onChapterTap(chapter),
           ),
         ),
       ),
     );
+    // 不可选的章整行变暗；点按已被 onTap=null 挡住，宿主的 _toggleSelectedChapter
+    // 还有一道守卫。只有置灰时才多一层 Opacity，正常行不增加合成开销。
+    return selectable
+        ? listRow
+        : Opacity(opacity: 0.38, child: listRow);
   }
 
   static Widget _anchored(GlobalKey? anchor, Widget child) =>
