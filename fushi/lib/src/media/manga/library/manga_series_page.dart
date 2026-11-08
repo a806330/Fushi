@@ -291,8 +291,16 @@ class _MangaSeriesPageState extends ConsumerState<MangaSeriesPage> {
     }
   }
 
-  /// 在库时的 bookKey；未入库的源条目为 null。
-  String? get _bookKey => _row?.bookKey;
+  /// 下载任务用的 bookKey。在库取书架行；「在线 → 发现 → 搜索」进来的作品
+  /// 还没入库，但任务表的 key 是从 entry 纯函数算出来的（与入库后完全一致），
+  /// 所以这里照样给出 key，让下载 / 删除 / 状态刷新在未入库时也成立。
+  String? get _bookKey {
+    final EpubBookRow? row = _row;
+    if (row != null) return row.bookKey;
+    final OnlineMangaLibraryEntry? entry = _entry;
+    if (entry == null) return null;
+    return OnlineMangaLibraryService.bookKeyOf(entry);
+  }
 
   /// 本条目的章节能不能下载（按运行时的合规门：Kavita 在 iOS 只直读不下载）。
   bool get _downloadsAllowed {
@@ -505,10 +513,10 @@ class _MangaSeriesPageState extends ConsumerState<MangaSeriesPage> {
   }
 
   Future<void> _refreshDownloadState() async {
-    final EpubBookRow? row = _row;
+    final String? bookKey = _bookKey;
     final OnlineMangaLibraryEntry? entry = _entry;
     final AppModel? appModel = _appModelOrNull;
-    if (row == null || entry == null || appModel == null) return;
+    if (bookKey == null || entry == null || appModel == null) return;
     final MangaDownloadService downloads = appModel.mangaDownloadService;
     _jobsWatch ??= downloads.watchJobs().listen(
       (_) => _scheduleDownloadStateRefresh(),
@@ -521,9 +529,9 @@ class _MangaSeriesPageState extends ConsumerState<MangaSeriesPage> {
       },
     );
     final Map<String, MangaDownloadJobRow> jobs = await downloads.jobsForBook(
-      row.bookKey,
+      bookKey,
     );
-    final String bookDir = await MangaStorage.bookPath(row.bookKey);
+    final String bookDir = await MangaStorage.bookPath(bookKey);
     Set<String> downloaded = await downloadedChapterKeys(
       bookDir,
       entry.chapters.map((OnlineMangaChapter chapter) => chapter.key),
@@ -541,7 +549,8 @@ class _MangaSeriesPageState extends ConsumerState<MangaSeriesPage> {
       _downloaded = downloaded;
       _bookDir = bookDir;
     });
-    _watchOcr(row.bookKey);
+    // OCR 只对在库卷有意义；未入库的源浏览页只借这条通道刷下载状态。
+    if (_row != null) _watchOcr(bookKey);
   }
 
   Future<void> _enqueueChapter(OnlineMangaChapter chapter) async {
@@ -578,16 +587,26 @@ class _MangaSeriesPageState extends ConsumerState<MangaSeriesPage> {
   /// 在系统文件管理器里定位某章的本地下载：与书架漫画卷同形，优先选中该章的
   /// `manga.json`，不在了再退回打开章目录；都打不开才提示。
   Future<void> _revealChapterDownload(OnlineMangaChapter chapter) async {
-    final EpubBookRow? row = _row;
-    if (row == null) return;
+    final String? bookKey = _bookKey;
+    final AppModel? appModel = _appModelOrNull;
+    if (bookKey == null || appModel == null) return;
+    // 明文导出模式下章节落在用户选的根目录，优先定位那里；内部副本作兜底。
+    final List<String> candidates = <String>[];
+    final MangaDownloadJobRow? job = _jobs[chapter.key];
+    if (job != null) {
+      candidates.addAll(
+        await appModel.mangaDownloadService.exportChapterDirectories(job),
+      );
+    }
     final Directory chapterDir = mangaChapterDirectory(
-      await MangaStorage.bookPath(row.bookKey),
+      await MangaStorage.bookPath(bookKey),
       chapter.key,
     );
-    final bool revealed = await revealFirstOf(<String>[
+    candidates.addAll(<String>[
       mangaChapterJsonFile(chapterDir).path,
       chapterDir.path,
     ]);
+    final bool revealed = await revealFirstOf(candidates);
     if (revealed || !mounted) return;
     FushiToast.show(
       msg: t.media_file_location_failed,
@@ -600,8 +619,9 @@ class _MangaSeriesPageState extends ConsumerState<MangaSeriesPage> {
   /// 2026-10 体验优化：原先菜单一点即删整章页图（重下要再跑一遍网络 + OCR），
   /// 先确认（写明章名），删完给 Toast。
   Future<void> _deleteChapterDownload(OnlineMangaChapter chapter) async {
-    final EpubBookRow? row = _row;
-    if (row == null) return;
+    final String? bookKey = _bookKey;
+    final AppModel? appModel = _appModelOrNull;
+    if (bookKey == null || appModel == null) return;
     final bool confirmed = await showFushiConfirmDialog(
       context: context,
       title: t.manga_chapter_download_delete_action,
@@ -612,10 +632,20 @@ class _MangaSeriesPageState extends ConsumerState<MangaSeriesPage> {
     );
     if (!confirmed || !mounted) return;
     try {
-      await deleteChapterDownload(
-        await MangaStorage.bookPath(row.bookKey),
-        chapter.key,
-      );
+      final MangaDownloadJobRow? job = _jobs[chapter.key];
+      if (job != null) {
+        // 明文导出模式下章节在用户选的根目录，deleteJob(deleteFiles: true)
+        // 会连任务行带导出章目录一起清（含跨重启的持久化根目录兜底）。
+        await appModel.mangaDownloadService.deleteJob(
+          job.jobId,
+          deleteFiles: true,
+        );
+      } else {
+        await deleteChapterDownload(
+          await MangaStorage.bookPath(bookKey),
+          chapter.key,
+        );
+      }
       if (mounted) FushiToast.show(msg: t.storage_entry_delete_done);
     } on Object catch (error, stack) {
       ErrorLogService.instance.log(
@@ -1998,7 +2028,7 @@ class _MangaSeriesPageState extends ConsumerState<MangaSeriesPage> {
               ? null
               : (OnlineMangaChapter chapter) =>
                     unawaited(_revealChapterDownload(chapter)),
-          onOcr: _bookKey == null
+          onOcr: _row == null
               ? null
               : (OnlineMangaChapter chapter) => unawaited(_ocrChapter(chapter)),
         ),
@@ -2470,8 +2500,9 @@ class _MangaSeriesPageState extends ConsumerState<MangaSeriesPage> {
           onPressed: _busy ? null : () => unawaited(_addToLibrary()),
         ),
       // 下载 / 批量删除下载：进入章节多选（勾选 + 全选 / 反选），确认时再决定动作。
-      // 任务表按 bookKey 记，只在在库时才有意义。
-      if (inLibrary && _downloadsAllowed) ...<Widget>[
+      // 任务表按 bookKey 记；源浏览页虽未入库，但 bookKey 可由 entry 算出（与入库后
+      // 同一个 key），所以在「在线 → 发现 → 搜索」详情页也保留这套入口。
+      if (_bookKey != null && _downloadsAllowed) ...<Widget>[
         MediaDetailSecondaryButton(
           buttonKey: const ValueKey<String>('manga_series_download'),
           icon: FushiIcons.download,
