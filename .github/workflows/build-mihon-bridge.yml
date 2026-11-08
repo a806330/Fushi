@@ -1,0 +1,53 @@
+name: Build Mihon Bridge (sidecar only)
+
+# 只重编 Java/Kotlin sidecar，产出的 mihon_bridge 目录可直接覆盖本机
+# D:\Fushi\mihon_bridge\。不含任何 Flutter/Dart 步骤：app.so 由
+# build-windows-aot.yml 产出，两者独立热替换到既有安装目录。
+#
+# 存在的意义：CF 代发链路的 Kotlin 侧（HostProxyPolicy / MihonImageProxy /
+# FastCloseSSLSocketFactory）住在这个 jar 里；完整 AOT workflow 跑一轮约 20 分钟，
+# 而这个只跑 Gradle，约 3 分钟，便于快速迭代 Kotlin 编译错误。
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/download-plaintext-export
+    paths:
+      - 'third_party/m_extension_server/**'
+      - 'tool/mihon/**'
+      - '.github/workflows/build-mihon-bridge.yml'
+
+concurrency:
+  group: mihon-bridge-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mihon:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      # 纯 Gradle 构建：脚本自带 Temurin JDK21 + Gradle 下载、vendored 源码、
+      # overlay 覆盖、:server:test + :server:shadowJar、jdeps/jlink。
+      - name: Build Mihon desktop runtime
+        shell: pwsh
+        run: |
+          $built = "$env:RUNNER_TEMP\mihon-runtime"
+          if (Test-Path -LiteralPath $built) { Remove-Item -LiteralPath $built -Recurse -Force }
+          .\tool\mihon\build_desktop_runtime.ps1 -OutputDirectory $built -DownloadCache "$env:RUNNER_TEMP\fushi-mihon-downloads"
+          if ($LASTEXITCODE -ne 0) { throw "Mihon desktop runtime build failed ($LASTEXITCODE)" }
+          .\tool\mihon\verify_desktop_runtime.ps1 -RuntimeDirectory $built
+          if ($LASTEXITCODE -ne 0) { throw "Mihon runtime verification failed ($LASTEXITCODE)" }
+
+      - name: Upload mihon_bridge
+        uses: actions/upload-artifact@v7
+        with:
+          name: mihon-bridge
+          path: ${{ runner.temp }}/mihon-runtime
+          if-no-files-found: error
+          retention-days: 7
