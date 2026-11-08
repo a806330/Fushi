@@ -175,12 +175,6 @@ dependency_overrides:
   # 这是上游约束过紧的兼容层，不是本仓缺陷。清理条件：上游把那行换成 3/4 通吃的
   # 写法、或把约束放宽成 `>=3.6.1 <5.0.0`——届时删掉这条 override 与补丁目录。
   # sha 一变补丁自动跳过并告警，不会静默失效。
-  # 云端构建修复：subosito 把 Flutter 3.47.6 重滚成了 Dart 更严格的构建，导致这份
-  # 23 个月未更新的 lock 里 dartssh2 2.11.0 / pdfrx_engine 0.4.4 的潜在空安全缺陷
-  # 现在被判定为编译错误。升到当前、已修干净的版本（仍落在各自依赖约束内：
-  # dartssh2 ^2.9.0、pdfrx_engine ^0.4.4）。lock 由 `flutter pub get` 自动重解。
-  dartssh2: 2.22.5
-  pdfrx_engine: 0.4.7
   archive: ^3.6.1
 
 # Melos 7 的配置位置就是这里（7.0 起 melos.yaml 被废弃）。包列表不再重复声明：

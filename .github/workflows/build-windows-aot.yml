@@ -71,6 +71,22 @@ jobs:
         working-directory: fushi
         run: flutter pub get
 
+      # 复刻上游 release-desktop.yml 的 windows job：pub get 之后必须打 pub-cache
+      # 补丁，否则 kernel 编译直接失败。ci/apply-patches.sh 会把
+      # ci/patches/hosted/<pkg>-<ver>/ 与 ci/patches/git/ 下的源文件覆盖进
+      # pub-cache，并给 Flutter framework 打 flutter-sdk 补丁（都编进 app.so）。
+      # 其中 dartssh2-2.11.0、pdfrx_engine-0.4.4 两个补丁正是修 Dart 3.13 收紧
+      # 「闭包捕获可空变量跨 await 的类型提升」后的编译错误（各加一个 ! 非空断言），
+      # 详见 ci/patches/hosted/*/FUSHI_PATCH.md。注：这些包不能靠升版本解决——
+      # dartssh2 2.15+ 要 pointycastle ^4、pdfrx_engine 0.4.6+ 要 archive ^4 /
+      # image ^4.8，都会引发全仓主版本迁移，故上游选择锁版本 + 打补丁。
+      - name: Apply pub cache patches
+        shell: bash
+        run: |
+          echo "PUB_CACHE=${PUB_CACHE:-<unset>}"
+          chmod +x ci/apply-patches.sh
+          bash ci/apply-patches.sh
+
       - name: Build Windows release (app.so)
         working-directory: fushi
         run: flutter build windows --release
