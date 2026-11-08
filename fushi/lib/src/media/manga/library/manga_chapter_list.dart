@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/widgets.dart' show Opacity;
 import 'package:material_ui/material_ui.dart';
 
 import 'package:fushi/src/focus/fushi_focus_scroll.dart';
@@ -79,6 +80,7 @@ class MangaChapterList extends StatelessWidget {
     // [MediaDetailItemRow.selected]），点按整行切换选中，行尾菜单收起以免冲突。
     this.selectionMode = false,
     this.selectedChapterKeys = const <String>{},
+    this.selectionEnabled,
     this.onToggleSelect,
     this.onSelectAll,
     this.onInvertSelection,
@@ -143,6 +145,11 @@ class MangaChapterList extends StatelessWidget {
 
   /// 多选模式下已选中的章节 key 集合（来源是宿主持有的状态）。
   final Set<String> selectedChapterKeys;
+
+  /// 多选模式下这一行能不能被选中；返回 false 的行置灰且不吃点击。
+  /// null（默认）= 全部可选，保持其它宿主（阅读器章节抽屉）的原行为。
+  /// 判据由宿主持有：批量删除下载时只有已下载 / 有任务行的章才有东西可删。
+  final bool Function(OnlineMangaChapter chapter)? selectionEnabled;
 
   /// 多选模式下点按某章：切换其选中态。null = 不响应（宿主未接，理论不应出现）。
   final void Function(OnlineMangaChapter chapter)? onToggleSelect;
@@ -360,13 +367,17 @@ class MangaChapterList extends StatelessWidget {
     final _ChapterDownloadState download = _downloadStateOf(chapter);
     final MangaDownloadJobRow? job = jobsByChapterKey[chapter.key];
     final int pagesTotal = job?.pagesTotal ?? 0;
-    // 多选：整行显示选中标记、点按切换选中，行尾菜单收起。
-    final bool selected =
-        selectionMode && selectedChapterKeys.contains(chapter.key);
+    // 多选：整行显示选中标记、点按切换选中，行尾菜单收起。宿主判为不可选的章
+    // （例如「取消下载」里的未下载章）置灰、不吃点击，也不显示成已勾选。
+    final bool selectable =
+        !selectionMode || selectionEnabled?.call(chapter) != false;
+    final bool selected = selectionMode &&
+        selectable &&
+        selectedChapterKeys.contains(chapter.key);
     // 相邻章节常有相同下载状态，列表身份必须取章节 key；状态探针放在每章内部，
     // 避免重复 sibling key，且排序 / 下载状态变化时保留该章的进场状态。
     final GlobalKey? anchor = current ? currentChapterAnchorKey : null;
-    return FushiStaggeredEntrance(
+    final Widget listRow = FushiStaggeredEntrance(
       key: ValueKey<String>('manga_chapter_${chapter.key}'),
       index: index,
       child: KeyedSubtree(
@@ -404,14 +415,21 @@ class MangaChapterList extends StatelessWidget {
             selected: selectionMode ? selected : null,
             trailing: selectionMode ? null : _buildMenu(chapter, download),
             onTap: selectionMode
-                ? () {
-                    onToggleSelect?.call(chapter);
-                  }
+                ? (selectable
+                    ? () {
+                        onToggleSelect?.call(chapter);
+                      }
+                    : null)
                 : () => onChapterTap(chapter),
           ),
         ),
       ),
     );
+    // 不可选的章整行变暗；点按已被 onTap=null 挡住，宿主的 _toggleSelectedChapter
+    // 还有一道守卫。只有置灰时才多一层 Opacity，正常行不增加合成开销。
+    return selectable
+        ? listRow
+        : Opacity(opacity: 0.38, child: listRow);
   }
 
   static Widget _anchored(GlobalKey? anchor, Widget child) =>
