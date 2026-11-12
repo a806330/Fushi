@@ -13,12 +13,15 @@ import 'package:fushi/src/media/manga/mihon/mihon_child_process_containment.dart
 import 'package:fushi/src/media/manga/mihon/mihon_cloudflare_gate.dart';
 import 'package:fushi/src/media/manga/cookie/manga_cookie_jar.dart';
 import 'package:fushi/src/media/manga/mihon/mihon_cookie_jar.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_cf_cert_manager.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_cf_webview2_fetch_proxy.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_cf_webview2_fetcher.dart';
 import 'package:fushi/src/media/manga/mihon/mihon_models.dart';
 import 'package:fushi/src/media/manga/mihon/mihon_runtime.dart';
 import 'package:fushi/src/media/manga/mihon/mihon_proxy_policy_server.dart';
 
-const Duration kMihonSourceImageHeaderTimeout = Duration(seconds: 90);
-const Duration kMihonSourceImageIdleTimeout = Duration(seconds: 90);
+const Duration kMihonSourceImageHeaderTimeout = Duration(seconds: 20);
+const Duration kMihonSourceImageIdleTimeout = Duration(seconds: 20);
 const int kMihonSourceImageMaxBytes = 32 * 1024 * 1024;
 
 /// 读取漫画源封面时按“无进度”计时，而不是从请求开始固定倒数。
@@ -56,10 +59,10 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     Directory? resourceDirectory,
     http.Client? httpClient,
     MihonCookieJar? cookieJar,
-  }) : resourceDirectory = resourceDirectory ?? _defaultResourceDirectory(),
-       _processContainment = MihonChildProcessContainment.platform(),
-       _http = httpClient ?? http.Client(),
-       _cookies = cookieJar ?? MihonCookieJar.shared;
+  })  : resourceDirectory = resourceDirectory ?? _defaultResourceDirectory(),
+        _processContainment = MihonChildProcessContainment.platform(),
+        _http = httpClient ?? _NoKeepAliveClient(httpClient ?? http.Client()),
+        _cookies = cookieJar ?? MihonCookieJar.shared;
 
   final Directory dataDirectory;
   final Directory resourceDirectory;
@@ -80,6 +83,11 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
   Future<void>? _starting;
   bool _disposed = false;
   MihonProxyPolicyServer? _proxyPolicy;
+  // CF 代发（内置 WebView2）：本地 relay + 证书管理器。仅当 relay 成功起来且合并信任库
+  // 生成成功时，才把 relay 端口喂给 proxyPolicy（③路由）并给 JVM 挂 trustStore（④）；
+  // 任一失败 → 不启用代发，行为等同现状（绝不比现状差）。
+  MihonCfFetchProxy? _cfFetchProxy;
+  MihonCfCertManager? _cfCertManager;
   final Map<String, _CachedApk> _apkCache = <String, _CachedApk>{};
   final Map<String, http.Client> _imageClients = <String, http.Client>{};
   int _imageRequestSequence = 0;
@@ -99,13 +107,13 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
   }
 
   Map<String, String> get _headers => <String, String>{
-    'Authorization': 'Bearer $_token',
-    // NanoHTTPD 2.3.1 falls back to US-ASCII when a request content type
-    // omits its charset. Mihon manga URLs commonly contain CJK text, so
-    // omitting this parameter corrupts those URLs into U+FFFD on the
-    // bridge round trip and makes otherwise valid detail pages return 404.
-    'Content-Type': 'application/json; charset=utf-8',
-  };
+        'Authorization': 'Bearer $_token',
+        // NanoHTTPD 2.3.1 falls back to US-ASCII when a request content type
+        // omits its charset. Mihon manga URLs commonly contain CJK text, so
+        // omitting this parameter corrupts those URLs into U+FFFD on the
+        // bridge round trip and makes otherwise valid detail pages return 404.
+        'Content-Type': 'application/json; charset=utf-8',
+      };
 
   /// [_headers] 再加上 [source] 站点的登录 cookie。
   ///
@@ -250,13 +258,14 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     MihonSource source,
     MihonPage page, {
     List<MihonPreference> preferences = const <MihonPreference>[],
-  }) => fetchImageRequest(
-    extension,
-    source,
-    page,
-    requestId: 'direct-${_imageRequestSequence++}',
-    preferences: preferences,
-  );
+  }) =>
+      fetchImageRequest(
+        extension,
+        source,
+        page,
+        requestId: 'direct-${_imageRequestSequence++}',
+        preferences: preferences,
+      );
 
   @override
   Future<Uint8List> fetchImageRequest(
@@ -282,11 +291,16 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     final http.Client? replaced = _imageClients[requestId];
     replaced?.close();
     _imageClients[requestId] = imageClient;
+    final Stopwatch perfWatch = Stopwatch()..start();
     try {
       final http.Response response = await imageClient
           .get(requested, headers: _headers)
           .timeout(const Duration(seconds: 45));
       if (response.statusCode != HttpStatus.ok) {
+        stderr.writeln(
+          '[Fushi][mihon-perf] GET /image req=$requestId '
+          'HTTP_${response.statusCode} ms=${perfWatch.elapsedMilliseconds}',
+        );
         throw MihonRuntimeException(
           'IMAGE_HTTP_${response.statusCode}',
           'Mihon image proxy request failed',
@@ -298,6 +312,10 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
           'Mihon source returned an empty image',
         );
       }
+      stderr.writeln(
+        '[Fushi][mihon-perf] GET /image req=$requestId '
+        'bytes=${response.bodyBytes.length} ms=${perfWatch.elapsedMilliseconds}',
+      );
       return response.bodyBytes;
     } finally {
       if (identical(_imageClients[requestId], imageClient)) {
@@ -322,6 +340,7 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     List<MihonPreference> preferences = const <MihonPreference>[],
   }) async {
     await _ensureStarted();
+    final Stopwatch perfWatch = Stopwatch()..start();
     final http.Request request = http.Request('POST', _uri('/source-image'))
       ..headers.addAll(await _headersFor(source))
       ..body = jsonEncode(<String, Object?>{
@@ -330,20 +349,27 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
         'url': url,
         'preferences': mihonBridgePreferences(source, preferences),
       });
-    final http.StreamedResponse response = await _http
-        .send(request)
-        .timeout(kMihonSourceImageHeaderTimeout);
+    final http.StreamedResponse response =
+        await _http.send(request).timeout(kMihonSourceImageHeaderTimeout);
     // 封面/图片请求往往比 `/dalvik` 更频繁，先撞上会话续期的通常正是它们；
     // 只注入不回收，等于把这条链路上换发的新 cookie 全丢掉。
     await _absorbResponseCookies(source, response.headers);
     if (response.statusCode != HttpStatus.ok) {
       await response.stream.drain<void>().timeout(kMihonSourceImageIdleTimeout);
+      stderr.writeln(
+        '[Fushi][mihon-perf] POST /source-image url=$url '
+        'HTTP_${response.statusCode} ms=${perfWatch.elapsedMilliseconds}',
+      );
       throw MihonRuntimeException(
         'IMAGE_HTTP_${response.statusCode}',
         'Mihon source image request failed',
       );
     }
     final Uint8List bytes = await readMihonSourceImageBytes(response.stream);
+    stderr.writeln(
+      '[Fushi][mihon-perf] POST /source-image url=$url '
+      'bytes=${bytes.length} ms=${perfWatch.elapsedMilliseconds}',
+    );
     if (bytes.isEmpty) {
       throw const MihonRuntimeException(
         'EMPTY_IMAGE',
@@ -438,6 +464,15 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     await log?.close();
     await _proxyPolicy?.close();
     _proxyPolicy = null;
+    // CF 代发（内置 WebView2）回收：关掉本地 relay + 各 host TLS 端点 + 销毁取数 WebView。
+    // 失败不影响 sidecar 收尾（代发是可降级的附加能力，不连累关停）。
+    try {
+      await _cfFetchProxy?.stop();
+    } on Object {
+      // ignore
+    }
+    _cfFetchProxy = null;
+    _cfCertManager = null;
   }
 
   Future<void> _ensureStarted() async {
@@ -481,8 +516,63 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
       List<int>.generate(32, (_) => random.nextInt(256)),
     ).replaceAll('=', '');
     await _proxyPolicy?.close();
-    final MihonProxyPolicyServer proxyPolicy =
-        await MihonProxyPolicyServer.start(token);
+
+    // 重启前回收上一轮的 CF 代发 relay（连同其 per-host TLS 端点 + WebView 取数器）：
+    // stop() 内部会调 fetcher.dispose()，否则旧端口 / socket / renderer 都泄漏。
+    // 首次 _start() 时 _cfFetchProxy 为 null，这是空操作，安全。
+    try {
+      await _cfFetchProxy?.stop();
+    } on Object {
+      // ignore
+    }
+    _cfFetchProxy = null;
+    _cfCertManager = null;
+
+    // ---- CF 代发（内置 WebView2）接线：起本地 relay + 生成合并信任库 ----
+    // 全部 best-effort：任一环节失败 → 不启用代发（proxyPolicy 拿不到 cf 端口、
+    // JVM 不挂 trustStore），行为等同现状。绝不因代发未就绪拖垮 sidecar 启动。
+    int? cfRelayPort;
+    File? cfTrustStore;
+    try {
+      final MihonCfCertManager cfCertManager = MihonCfCertManager(dataDirectory);
+      final MihonCfFetchProxy cfFetchProxy = MihonCfFetchProxy(
+        certManager: cfCertManager,
+        fetcher: WebView2CfFetcher(),
+      );
+      cfRelayPort = await cfFetchProxy.start();
+      _cfFetchProxy = cfFetchProxy;
+      _cfCertManager = cfCertManager;
+      debugPrint('[Fushi][mihon-cf] relay started on port $cfRelayPort');
+      // 合并信任库：runtime 自带 cacerts + 内置 CA（keytool 合成 PKCS12，145 条）。
+      // 实测：-Djavax.net.ssl.trustStore 替换默认库后，既信我们 CA（代发 mycomic）
+      // 又保住系统根证书（sidecar 访问其它漫画源不崩），双目标均通过。
+      cfTrustStore = await cfCertManager.materializeMergedTrustStore(
+        keytool: _keytoolPath(),
+        runtimeCacerts: _runtimeCacertsPath(),
+      );
+      debugPrint('[Fushi][mihon-cf] trustStore = ${cfTrustStore?.path ?? "NULL"} '
+          '(keytool=${_keytoolPath().path}, cacerts=${_runtimeCacertsPath().path})');
+    } on Object catch (error, stack) {
+      debugPrint('[Fushi][mihon-cf] delegation init FAILED: $error\n$stack');
+      cfRelayPort = null;
+      cfTrustStore = null;
+    }
+    // 信任库没生成 → 关掉 relay：无信任库的代发会让 JVM 拒连、徒增 502，不如不启用。
+    if (cfTrustStore == null) {
+      try {
+        await _cfFetchProxy?.stop();
+      } on Object {
+        // ignore
+      }
+      _cfFetchProxy = null;
+      _cfCertManager = null;
+      cfRelayPort = null;
+    }
+
+    final MihonProxyPolicyServer proxyPolicy = await MihonProxyPolicyServer.start(
+      token,
+      cfFetchProxyPort: cfRelayPort,
+    );
     _proxyPolicy = proxyPolicy;
     final Process process = await Process.start(
       java.path,
@@ -490,6 +580,12 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
         '-Xmx512m',
         '-Djava.awt.headless=true',
         '-Djava.util.prefs.userRoot=${preferences.path}',
+        if (cfTrustStore != null)
+          ...<String>[
+            '-Djavax.net.ssl.trustStore=${cfTrustStore!.path}',
+            '-Djavax.net.ssl.trustStoreType=PKCS12',
+            '-Djavax.net.ssl.trustStorePassword=changeit',
+          ],
         '-jar',
         server.path,
         // 0 = "bind an ephemeral port yourself and tell us which one".
@@ -553,11 +649,11 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
         .transform(const Utf8Decoder(allowMalformed: true))
         .transform(const LineSplitter())
         .listen((String line) {
-          log.write(line);
-          if (announced.isCompleted) return;
-          final int? port = _parseReadyPort(line);
-          if (port != null) announced.complete(port);
-        });
+      log.write(line);
+      if (announced.isCompleted) return;
+      final int? port = _parseReadyPort(line);
+      if (port != null) announced.complete(port);
+    });
     process.stderr
         .transform(const Utf8Decoder(allowMalformed: true))
         .transform(const LineSplitter())
@@ -755,6 +851,10 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
     MihonSource? source,
   }) async {
     await _ensureStarted();
+    final Stopwatch perfWatch = Stopwatch()..start();
+    final Object? perfTag = body['method'] ?? body['url'] ?? body['sourceId'];
+    final int perfDataLen =
+        body['data'] is String ? (body['data']! as String).length : 0;
     try {
       final http.Response response = await _http
           .post(
@@ -769,10 +869,18 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
       if (response.statusCode < 200 || response.statusCode >= 300) {
         throw decodeErrorResponse(response);
       }
-      return response.body.isEmpty ? null : jsonDecode(response.body);
-    } on MihonRuntimeException {
-      rethrow;
+      final Object? decoded =
+          response.body.isEmpty ? null : jsonDecode(response.body);
+      stderr.writeln(
+        '[Fushi][mihon-perf] POST $path tag=$perfTag bodyLen=$perfDataLen '
+        'respLen=${response.body.length} ms=${perfWatch.elapsedMilliseconds}',
+      );
+      return decoded;
     } on TimeoutException catch (error) {
+      stderr.writeln(
+        '[Fushi][mihon-perf] POST $path tag=$perfTag bodyLen=$perfDataLen '
+        'TIMEOUT ms=${perfWatch.elapsedMilliseconds}',
+      );
       // A slow source is not evidence that the shared JVM has died. Killing it
       // here aborts every concurrent source search and silently replays actions.
       throw MihonRuntimeException(
@@ -781,6 +889,10 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
         cause: error,
       );
     } on Object catch (error) {
+      stderr.writeln(
+        '[Fushi][mihon-perf] POST $path tag=$perfTag bodyLen=$perfDataLen '
+        'FAILED ms=${perfWatch.elapsedMilliseconds} err=$error',
+      );
       throw MihonRuntimeException(
         'BRIDGE_IO',
         'M-Extension-Server request failed',
@@ -831,14 +943,46 @@ class DesktopMihonRuntime extends MihonBridgeRuntime
   String _javaExecutablePath() {
     // macOS 版只出 Apple Silicon（arm64），bundle 里只有这一份 JVM 镜像
     // （tool/mihon/build_desktop_runtime.sh）；Intel Mac 不再支持。
-    final String runtimeName = Platform.isMacOS
-        ? 'runtime-macos-arm64'
-        : 'runtime';
+    final String runtimeName =
+        Platform.isMacOS ? 'runtime-macos-arm64' : 'runtime';
     return p.join(
       resourceDirectory.path,
       runtimeName,
       'bin',
       Platform.isWindows ? 'java.exe' : 'java',
+    );
+  }
+
+  /// 合并 CF 信任库要用的 keytool（Fushi 自带 runtime 的 `bin/keytool(.exe)`）。
+  /// 与 [_javaExecutablePath] 同布局。缺失时 `materializeMergedTrustStore` 返回
+  /// null → 代发降级到现状（不连累启动）。
+  File _keytoolPath() {
+    final String runtimeName =
+        Platform.isMacOS ? 'runtime-macos-arm64' : 'runtime';
+    return File(
+      p.join(
+        resourceDirectory.path,
+        runtimeName,
+        'bin',
+        Platform.isWindows ? 'keytool.exe' : 'keytool',
+      ),
+    );
+  }
+
+  /// JVM 自带根证书库（`lib/security/cacerts`）。合并它（而非系统 ca-bundle）
+  /// 才能保证与 Fushi 内置 JVM 实际信任的根证书集合一致——这是「替换 trustStore
+  /// 不破坏 sidecar 访问其它源」的前提。
+  File _runtimeCacertsPath() {
+    final String runtimeName =
+        Platform.isMacOS ? 'runtime-macos-arm64' : 'runtime';
+    return File(
+      p.join(
+        resourceDirectory.path,
+        runtimeName,
+        'lib',
+        'security',
+        'cacerts',
+      ),
     );
   }
 
@@ -958,5 +1102,16 @@ class _SidecarLogSink {
     } on Object {
       // 关闭失败无所谓：进程已经退出，文件由 OS 收尾。
     }
+  }
+}
+
+
+class _NoKeepAliveClient extends http.BaseClient {
+  final http.Client _inner;
+  _NoKeepAliveClient(this._inner);
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) {
+    request.persistentConnection = false;
+    return _inner.send(request);
   }
 }
