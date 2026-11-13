@@ -1,0 +1,40 @@
+name: CF Delegation Unit Test
+
+# 云端验证第一层：纯逻辑单测（不联网、不需浏览器）。
+# 仅在我们改动的 CF 代发相关文件或本 workflow 变动时触发，避免每次 push 都跑。
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/download-330]
+    paths:
+      - 'fushi/lib/src/media/manga/mihon/mihon_cf_*.dart'
+      - 'fushi/test/mihon_cf_delegation_test.dart'
+      - '.github/workflows/unit-test.yml'
+
+jobs:
+  unit-test:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Flutter (stable 3.47.6)
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.6'
+          channel: 'stable'
+
+      - name: Apply pub cache patches
+        shell: bash
+        run: bash ci/apply-patches.sh
+
+      - name: flutter pub get
+        working-directory: fushi
+        run: flutter pub get
+
+      - name: analyze delegation
+        working-directory: fushi
+        run: flutter analyze lib/src/media/manga/mihon/mihon_cf_delegation.dart
+
+      - name: run delegation unit test
+        working-directory: fushi
+        run: flutter test test/mihon_cf_delegation_test.dart
