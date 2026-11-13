@@ -31,6 +31,11 @@ jobs:
         working-directory: fushi
         run: flutter pub get
 
+      - name: Generate i18n
+        # strings.g.dart 是未跟踪的生成文件，所有在 fushi/ 下 analyze/test 的前置步骤。
+        # 与发布构建一致用 composite action（在 repo root 跑 dart fushi/tool/gen_i18n.dart）。
+        uses: ./.github/actions/gen-i18n
+
       - name: analyze delegation
         working-directory: fushi
         run: flutter analyze lib/src/media/manga/mihon/mihon_cf_delegation.dart
