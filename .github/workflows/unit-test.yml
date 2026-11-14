@@ -23,13 +23,20 @@ jobs:
           flutter-version: '3.47.6'
           channel: 'stable'
 
-      - name: Apply pub cache patches
-        shell: bash
-        run: bash ci/apply-patches.sh
-
       - name: flutter pub get
         working-directory: fushi
         run: flutter pub get
+
+      # 补丁必须在 flutter pub get 之后跑：apply-patches.sh 是往 pub-cache 里已经
+      # 下载好的包目录里覆盖修复文件，目录按精确版本命名（如 dartssh2-2.11.0）。
+      # 若放在 pub get 之前，pub-cache 还是空的，脚本会把补丁全部跳过，结果
+      # dartssh2 / pdfrx_engine / media_kit 三处修复没打上，整包编译就报错。
+      # 顺序与发布构建 release-desktop.yml 的「pub get → apply patches」保持一致。
+      - name: Apply pub cache patches
+        shell: bash
+        run: |
+          chmod +x ci/apply-patches.sh
+          bash ci/apply-patches.sh
 
       - name: Generate i18n
         # strings.g.dart 是未跟踪的生成文件，所有在 fushi/ 下 analyze/test 的前置步骤。
