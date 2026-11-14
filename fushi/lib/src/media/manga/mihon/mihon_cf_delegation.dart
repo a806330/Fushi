@@ -108,6 +108,21 @@ class MihonCfDelegation {
     return <String>{h};
   }
 
+  /// 「从浏览器导入」时应当登记并打开的 host。
+  ///
+  /// Ahri8 的 `ahri8.com` 目前整站 302 到 `ahri8.monster`，登录态只落在后者。
+  /// 导入链路按**登记 host** 过滤扩展回传的 cookie（`BrowserLoginImport._onDelivery`
+  /// → `browserSiteCookiesForSite`），登记 `.com` 会把 `.monster` 上的会话全判成
+  /// 异站丢掉，表现为「已登录多次仍然导入无效」。这里给出真正承载登录的域；
+  /// 其它源原样返回，行为不变。
+  static String loginHostFor(String host) {
+    final String h = _norm(host);
+    // `www.` 对 cookie 归属没有意义：登录会话从不只发在 www 子域上。
+    final String bare = h.startsWith('www.') ? h.substring(4) : h;
+    if (bare == 'ahri8.com') return 'ahri8.monster';
+    return h;
+  }
+
   /// 从 [MihonSource] 的 baseUrl 判该源是否被 CF 保护（用于 UI 层「受 Cloudflare 保护」
   /// 徽标与提示，与 `manga_global_search_runner` 的按文案判型并列，不替代它）。
   static bool sourceIsCfProtected(MihonSource source) {

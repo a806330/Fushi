@@ -229,6 +229,17 @@ class _MihonWebLoginPageState extends State<MihonWebLoginPage> {
     super.dispose();
   }
 
+  /// 「从浏览器导入」要登记并打开的站点。
+  ///
+  /// 不能直接用 [widget.baseUrl]：Ahri8 的 `ahri8.com` 目前整站 302 到
+  /// `ahri8.monster`，登录态只落在后者；导入层按登记 host 过滤回传的 cookie，
+  /// 登记 `.com` 会把 `.monster` 的会话全丢掉（详见 `loginHostFor`）。
+  Uri get _loginSite {
+    final Uri base = widget.baseUrl;
+    final String host = MihonCfDelegation.loginHostFor(base.host);
+    return host == base.host ? base : base.replace(host: host);
+  }
+
   /// 登记导入并把源站交给系统浏览器；扩展送来的第一批本站 cookie 写 jar 并回灌
   /// WebView 后登记结束。
   Future<void> _beginBrowserImport(MangaCookieJar jar) async {
@@ -236,7 +247,10 @@ class _MihonWebLoginPageState extends State<MihonWebLoginPage> {
       write: (List<BrowserSiteCookie> cookies) => _applyCookies(jar, cookies),
       openExternal: widget.openExternal,
     )..addListener(_onImportChanged);
-    await import.begin(widget.baseUrl, open: widget.baseUrl);
+    // 登记与实际打开的地址都用 [_loginSite]：扩展按登记 host 取 cookie，
+    // 打开 .com 再靠 302 跳到 .monster，只会让两边的域对不上。
+    final Uri loginSite = _loginSite;
+    await import.begin(loginSite, open: loginSite);
   }
 
   void _onImportChanged() {

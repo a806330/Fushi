@@ -113,6 +113,22 @@ void main() {
     });
   });
 
+  group('loginHostFor（导入登录登记哪个域）', () {
+    test('Ahri8 的 .com 改登记内容域（.com 已整站 302 到 .monster）', () {
+      expect(MihonCfDelegation.loginHostFor('ahri8.com'), 'ahri8.monster');
+      expect(MihonCfDelegation.loginHostFor('AHRI8.COM'), 'ahri8.monster');
+      expect(MihonCfDelegation.loginHostFor('ahri8.com.'), 'ahri8.monster');
+      expect(MihonCfDelegation.loginHostFor('www.ahri8.com'), 'ahri8.monster');
+    });
+    test('已是内容域时原样返回', () {
+      expect(MihonCfDelegation.loginHostFor('ahri8.monster'), 'ahri8.monster');
+    });
+    test('其它源原样返回（只做小写归一，不影响既有源）', () {
+      expect(MihonCfDelegation.loginHostFor('MyComic.com'), 'mycomic.com');
+      expect(MihonCfDelegation.loginHostFor('example.com'), 'example.com');
+    });
+  });
+
   group('sourceIsCfProtected', () {
     test('mycomic baseUrl 判定为受保护', () {
       final MihonSource s = MihonSource(
