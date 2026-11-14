@@ -362,6 +362,27 @@ class _MihonWebLoginPageState extends State<MihonWebLoginPage> {
     });
   }
 
+  /// 按 cookie 自己的域分组，逐组调用 [jar.replaceForSite]。
+  ///
+  /// replaceForSite 是「整组替换」：它只保留不属于该站点的旧 cookie。若把
+  /// ahri8.com 与 ahri8.monster 的 cookie 混在一次调用里，后一个域的条目会被
+  /// 直接过滤掉。分组后每组互不影响；只有一个域的源行为与原来完全一致。
+  static Future<void> _replaceByDomain(
+    MangaCookieJar jar,
+    List<MangaCookie> fresh,
+  ) async {
+    final Map<String, List<MangaCookie>> grouped =
+        <String, List<MangaCookie>>{};
+    for (final MangaCookie cookie in fresh) {
+      grouped
+          .putIfAbsent(cookie.canonicalDomain, () => <MangaCookie>[])
+          .add(cookie);
+    }
+    for (final MapEntry<String, List<MangaCookie>> entry in grouped.entries) {
+      await jar.replaceForSite(entry.key, entry.value);
+    }
+  }
+
   /// 把浏览器里的整站 cookie 导出到 jar；返回导出条数。
   Future<int> _export(MangaCookieJar jar) async {
     final Set<String> siteHosts =
@@ -384,27 +405,6 @@ class _MihonWebLoginPageState extends State<MihonWebLoginPage> {
     if (fresh.isEmpty) return 0;
     await _replaceByDomain(jar, fresh);
     return fresh.length;
-
-  /// 按 cookie 自己的域分组，逐组调用 [jar.replaceForSite]。
-  ///
-  /// replaceForSite 是「整组替换」：它只保留不属于该站点的旧 cookie。若把
-  /// ahri8.com 与 ahri8.monster 的 cookie 混在一次调用里，后一个域的条目会被
-  /// 直接过滤掉。分组后每组互不影响；只有一个域的源行为与原来完全一致。
-  static Future<void> _replaceByDomain(
-    MangaCookieJar jar,
-    List<MangaCookie> fresh,
-  ) async {
-    final Map<String, List<MangaCookie>> grouped =
-        <String, List<MangaCookie>>{};
-    for (final MangaCookie cookie in fresh) {
-      grouped
-          .putIfAbsent(cookie.canonicalDomain, () => <MangaCookie>[])
-          .add(cookie);
-    }
-    for (final MapEntry<String, List<MangaCookie>> entry in grouped.entries) {
-      await jar.replaceForSite(entry.key, entry.value);
-    }
-  }
   }
 
   /// 浏览器 cookie → jar cookie。
