@@ -1549,7 +1549,11 @@ class _MangaSeriesPageState extends ConsumerState<MangaSeriesPage> {
     if (index < 0 || index >= entry.chapters.length) return;
     setState(() => _busy = true);
     try {
-      String? bookKey = _bookKey;
+      // 判据必须是「真的落库了没有」，不能用 [_bookKey]：它对未入库的在线作品
+      // 也会返回 `bookKeyOf(entry)` 算出来的 key（下载任务与媒体图谱要用），判据
+      // 就永远为假，下面这段入库永远不执行——阅读器拿着库里不存在的 key 去查
+      // 书架行，表现就是「找不到书籍文件」。只认真正落库的那一行。
+      String? bookKey = _row?.bookKey;
       if (bookKey == null) {
         // 从源里直接点章：先入库再读，否则进度、已读标记、断点续读全都无处可落。
         final EpubBookRow row = await service.add(entry);
