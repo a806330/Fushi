@@ -8,6 +8,7 @@ import 'package:fushi/src/media/manga/cookie/browser_cookie_import.dart';
 import 'package:fushi/src/media/manga/cookie/browser_login_import.dart';
 import 'package:fushi/src/media/manga/cookie/manga_cookie_jar.dart';
 import 'package:fushi/src/media/manga/cookie/manga_web_view_environment.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_cf_delegation.dart';
 import 'package:fushi/src/media/manga/mihon/mihon_cookie_jar.dart';
 import 'package:fushi/src/media/manga/mihon/mihon_runtime.dart';
 import 'package:fushi/src/utils/app_ui_scale.dart';
@@ -247,12 +248,23 @@ class _MihonWebLoginPageState extends State<MihonWebLoginPage> {
     MangaCookieJar jar,
     List<BrowserSiteCookie> cookies,
   ) async {
-    await jar.replaceForSite(
-      widget.baseUrl.host,
-      browserCookiesForSite(cookies, widget.baseUrl.host),
-    );
+    // Ahri8 的登录域（ahri8.com）与内容域（ahri8.monster）是两个注册域，
+    // 只按 baseUrl 的单 host 过滤会把 .monster 上的会话 cookie 全丢掉。
+    // 这里按站点域集合逐个收，再按 cookie 自己的域分组整组替换。
+    final Set<String> siteHosts =
+        MihonCfDelegation.siteHostsFor(widget.baseUrl.host);
+    final Map<String, MangaCookie> merged = <String, MangaCookie>{};
+    for (final String siteHost in siteHosts) {
+      for (final MangaCookie cookie
+          in browserCookiesForSite(cookies, siteHost)) {
+        merged['${cookie.name}${cookie.canonicalDomain}'] = cookie;
+      }
+    }
+    final List<MangaCookie> fresh = merged.values.toList(growable: false);
+    if (fresh.isEmpty) return 0;
+    await _replaceByDomain(jar, fresh);
     if (mounted) await _backfillWebView(cookies);
-    return cookies.length;
+    return fresh.length;
   }
 
   /// 把这批 cookie 写进本页 WebView 的环境并刷新当前页（见类文档）。
@@ -352,12 +364,14 @@ class _MihonWebLoginPageState extends State<MihonWebLoginPage> {
 
   /// 把浏览器里的整站 cookie 导出到 jar；返回导出条数。
   Future<int> _export(MangaCookieJar jar) async {
-    final String host = widget.baseUrl.host;
+    final Set<String> siteHosts =
+        MihonCfDelegation.siteHostsFor(widget.baseUrl.host);
     final Map<String, MangaCookie> deduped = <String, MangaCookie>{};
     for (final Uri origin in _visited) {
       final List<Cookie> cookies = await _readCookies(WebUri.uri(origin));
       for (final Cookie cookie in cookies) {
-        final MangaCookie? mapped = _toJarCookie(cookie, origin.host, host);
+        final MangaCookie? mapped =
+            _toJarCookie(cookie, origin.host, siteHosts);
         if (mapped == null) continue;
         // 按 (name, domain) 去重，**不是**只按 name：同名 cookie 在登录子域与
         // 内容域上取值不同是常态，只按 name 去重会让其中一份把另一份挤掉，而
@@ -368,13 +382,34 @@ class _MihonWebLoginPageState extends State<MihonWebLoginPage> {
     }
     final List<MangaCookie> fresh = deduped.values.toList(growable: false);
     if (fresh.isEmpty) return 0;
-    await jar.replaceForSite(host, fresh);
+    await _replaceByDomain(jar, fresh);
     return fresh.length;
+
+  /// 按 cookie 自己的域分组，逐组调用 [jar.replaceForSite]。
+  ///
+  /// replaceForSite 是「整组替换」：它只保留不属于该站点的旧 cookie。若把
+  /// ahri8.com 与 ahri8.monster 的 cookie 混在一次调用里，后一个域的条目会被
+  /// 直接过滤掉。分组后每组互不影响；只有一个域的源行为与原来完全一致。
+  static Future<void> _replaceByDomain(
+    MangaCookieJar jar,
+    List<MangaCookie> fresh,
+  ) async {
+    final Map<String, List<MangaCookie>> grouped =
+        <String, List<MangaCookie>>{};
+    for (final MangaCookie cookie in fresh) {
+      grouped
+          .putIfAbsent(cookie.canonicalDomain, () => <MangaCookie>[])
+          .add(cookie);
+    }
+    for (final MapEntry<String, List<MangaCookie>> entry in grouped.entries) {
+      await jar.replaceForSite(entry.key, entry.value);
+    }
+  }
   }
 
   /// 浏览器 cookie → jar cookie。
   ///
-  /// 只收与源站**同一站点**的条目：cookie 的域覆盖 [siteHost]（父域），或反过来
+  /// 只收与源站**同一站点**的条目：cookie 的域覆盖集合里任一 host（父域），或反过来
   /// 是它的子域。第三方域（统计、广告、SSO 供应商）一概不进 jar——它们对源站请求
   /// 没有用，进来只会被原样交给扩展，白白扩大外泄面。
   ///
@@ -384,7 +419,7 @@ class _MihonWebLoginPageState extends State<MihonWebLoginPage> {
   static MangaCookie? _toJarCookie(
     Cookie cookie,
     String originHost,
-    String siteHost,
+    Set<String> siteHosts,
   ) {
     final String name = cookie.name.trim();
     if (name.isEmpty) return null;
@@ -394,9 +429,13 @@ class _MihonWebLoginPageState extends State<MihonWebLoginPage> {
       hostOnly ? originHost : reported,
     );
     if (domain.isEmpty) return null;
-    final bool sameSite =
-        MangaCookie.hostMatchesDomain(siteHost, domain) ||
-        MangaCookie.hostMatchesDomain(domain, siteHost);
+    // 域名集合里任意一个 host 与 cookie 同站即收。Ahri8 的登录域与内容域
+    // 因此需要显式登记成一对别名，其它源集合里只有自己，判定不变。
+    final bool sameSite = siteHosts.any(
+      (String siteHost) =>
+          MangaCookie.hostMatchesDomain(siteHost, domain) ||
+          MangaCookie.hostMatchesDomain(domain, siteHost),
+    );
     if (!sameSite) return null;
     final num? expires = cookie.expiresDate as num?;
     return MangaCookie(

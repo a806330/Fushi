@@ -8,7 +8,7 @@ import 'package:fushi/src/media/manga/mihon/mihon_models.dart';
 /// - [image]：章节页图片等二进制。代取代理在 WebView2 里 `fetch(url).arrayBuffer()`
 ///   转 base64 取回，宿主再 decode 成字节回填。Chromium 的 fetch 也是浏览器指纹，
 ///   能过 CF 拿图。
-enum CfResource { page, image }
+enum CfResource { page, image, raw }
 
 /// Cloudflare「浏览器代发」宿主侧的 host 名单与资源类型判定。
 ///
@@ -73,6 +73,39 @@ class MihonCfDelegation {
     final String scheme = uri.scheme.toLowerCase();
     if (scheme != 'http' && scheme != 'https') return false;
     return isCfHost(uri.host);
+  }
+
+  /// 该 URL 是否必须取「原始响应体」，不能取网页 outerHTML。
+  ///
+  /// 松鼠症仓库（Ahri8）的列表 / 详情接口（如 `dnew.php`）返回的是一整段
+  /// AES 加密密文，不是 HTML 网页。若按 [CfResource.page] 用 WebView2 导航后取
+  /// `document.documentElement.outerHTML`，浏览器会把密文包进
+  /// `<html><body><pre>…</pre></body></html>` 并做 HTML 转义，扩展拿去解密就会报
+  /// `IllegalBlockSizeException`（长度不再是 16 的倍数）。这类接口必须走
+  /// [CfResource.raw]：在同源页面里用浏览器 fetch 取回原始文本，原样回填。
+  ///
+  /// 只认 Ahri8 两个域下的 `.php` 数据接口；MyComic 的页面依赖 JS 渲染，
+  /// 仍走 [CfResource.page]，一行都不改。非 http(s) 一律不代发。
+  static bool requiresRawBody(Uri uri) {
+    final String scheme = uri.scheme.toLowerCase();
+    if (scheme != 'http' && scheme != 'https') return false;
+    final String host = _norm(uri.host);
+    if (host != 'ahri8.com' && host != 'ahri8.monster') return false;
+    return uri.path.toLowerCase().endsWith('.php');
+  }
+
+  /// 该站点登录时应当一并收进 cookie jar 的域集合。
+  ///
+  /// Ahri8 的登录站在 `ahri8.com`、内容站在 `ahri8.monster`，是两个完全不同的
+  /// 注册域，浏览器的「同站」判定不认它们是一家人。登录页原来只按 baseUrl 的
+  /// 单个 host 过滤与整组替换，结果把 `.monster` 上真正有用的会话 cookie 全丢了。
+  /// 这里显式登记这一对别名；其它源返回只含自身 host 的集合，行为不变。
+  static Set<String> siteHostsFor(String host) {
+    final String h = _norm(host);
+    if (h == 'ahri8.com' || h == 'ahri8.monster') {
+      return <String>{'ahri8.com', 'ahri8.monster'};
+    }
+    return <String>{h};
   }
 
   /// 从 [MihonSource] 的 baseUrl 判该源是否被 CF 保护（用于 UI 层「受 Cloudflare 保护」

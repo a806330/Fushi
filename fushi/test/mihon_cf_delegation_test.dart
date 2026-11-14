@@ -63,6 +63,56 @@ void main() {
     });
   });
 
+  group('requiresRawBody（加密接口取原文）', () {
+    test('Ahri8 的列表接口必须走原始响应体', () {
+      expect(
+        MihonCfDelegation.requiresRawBody(
+            Uri.parse('https://ahri8.monster/dnew.php?t=1&page=1')),
+        isTrue,
+      );
+      expect(
+        MihonCfDelegation.requiresRawBody(
+            Uri.parse('https://ahri8.com/dnew.php')),
+        isTrue,
+      );
+      expect(
+        MihonCfDelegation.requiresRawBody(
+            Uri.parse('https://Ahri8.Monster/dnew.PHP?x=1')),
+        isTrue,
+      );
+    });
+    test('MyComic 页面与 Ahri8 首页仍走网页模式', () {
+      expect(
+        MihonCfDelegation.requiresRawBody(
+            Uri.parse('https://mycomic.com/cn/comics?sort=-views')),
+        isFalse,
+      );
+      expect(
+        MihonCfDelegation.requiresRawBody(
+            Uri.parse('https://ahri8.monster/')),
+        isFalse,
+      );
+      expect(
+        MihonCfDelegation.requiresRawBody(
+            Uri.parse('ftp://ahri8.monster/dnew.php')),
+        isFalse,
+      );
+    });
+  });
+
+  group('siteHostsFor（登录域与内容域互通）', () {
+    test('Ahri8 两个域互为别名', () {
+      expect(MihonCfDelegation.siteHostsFor('ahri8.com'),
+          unorderedEquals(['ahri8.com', 'ahri8.monster']));
+      expect(MihonCfDelegation.siteHostsFor('AHRI8.MONSTER'),
+          unorderedEquals(['ahri8.com', 'ahri8.monster']));
+    });
+    test('其它源只含自身', () {
+      expect(MihonCfDelegation.siteHostsFor('mycomic.com'),
+          unorderedEquals(['mycomic.com']));
+    });
+  });
+
   group('sourceIsCfProtected', () {
     test('mycomic baseUrl 判定为受保护', () {
       final MihonSource s = MihonSource(

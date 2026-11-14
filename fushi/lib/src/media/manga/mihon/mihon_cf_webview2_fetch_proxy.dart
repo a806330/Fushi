@@ -256,7 +256,13 @@ final class MihonCfFetchProxy {
       }
       // 同 host 下图片请求（按扩展名/路径判断）必须走 image 代发，否则会被当成 page
       // 取 outerHTML，导致图片损坏。Bato/Ahri8 的页面与图片同域，必须自适应。
-      if (_isImageRequest(url)) resource = CfResource.image;
+      if (_isImageRequest(url)) {
+        resource = CfResource.image;
+      } else if (MihonCfDelegation.requiresRawBody(url)) {
+        // Ahri8 的 .php 接口返回加密密文，取 outerHTML 会被浏览器包成
+        // <html><body><pre>…</pre>，扩展解密必失败。改走原始响应体。
+        resource = CfResource.raw;
+      }
       final CfFetchResult result =
           await fetcher.fetch(url, resource).timeout(kFetchTimeout);
       final int status = result.ok ? result.status : HttpStatus.badGateway;

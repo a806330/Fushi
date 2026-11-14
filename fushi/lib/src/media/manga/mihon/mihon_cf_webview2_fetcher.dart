@@ -62,6 +62,11 @@ final class CfFetchResult {
 
   factory CfFetchResult.page(String html, String contentType) =>
       CfFetchResult.success(body: utf8.encode(html), contentType: contentType);
+
+  /// 原样取回的非 HTML 响应体（如 Ahri8 的加密密文）。
+  /// 走字节数组而非字符串，避免任何字符编码往返造成的字节损失。
+  factory CfFetchResult.rawBytes(List<int> bytes, String contentType) =>
+      CfFetchResult.success(body: bytes, contentType: contentType);
 }
 
 /// 用 Fushi 自带的 [HeadlessInAppWebView]（与「站点验证」页同一套 WebView2 环境）
@@ -119,9 +124,9 @@ class WebView2CfFetcher extends MihonCfFetcher {
       // 轮询等 DOM 可解析（interactive），而非 complete——complete 要等图片等
       // 全部子资源下完，对「取 outerHTML」毫无必要，白等数秒。
       await _waitForDomReady(c, maxWait: const Duration(seconds: 6));
-      return resource == CfResource.image
-          ? await _fetchImage(c, url)
-          : await _fetchPage(c, url);
+      if (resource == CfResource.image) return await _fetchImage(c, url);
+      if (resource == CfResource.raw) return await _fetchRaw(c, url);
+      return await _fetchPage(c, url);
     } on Object catch (e, st) {
       // 取数失败一律降级：调用方退回原路（=现状）。绝不崩 app。
       debugLogMihonCf('fetch error for $url: $e\n$st');
@@ -229,6 +234,85 @@ class WebView2CfFetcher extends MihonCfFetcher {
       return CfFetchResult.failed(error: 'page DOM empty after wait');
     }
     return CfFetchResult.page(html, 'text/html; charset=utf-8');
+  }
+
+  /// 在已导航的同源页面里用浏览器 fetch 取回「原始字节」，不取 DOM。
+  ///
+  /// WebView2 的 ExecuteScript 不等待 Promise（未完成的 Promise 会被序列化成 `{}`），
+  /// 所以和图片分支完全同构：JS 侧 fetch → arrayBuffer → base64 写到
+  /// window.__rawResult，Dart 侧轮询取回后 base64.decode 还原字节。
+  /// 这样拿到的是服务端原始响应体，没有 `<html><body><pre>` 外壳、没有 HTML
+  /// 转义、也没有字符编码往返，扩展才能正确解密 Ahri8 的 AES 密文。
+  Future<CfFetchResult> _fetchRaw(InAppWebViewController c, Uri url) async {
+    final String u = jsonEncode(url.toString());
+    final Object? started = await c.evaluateJavascript(source: '''
+      (function(){
+        try {
+          window.__rawResult = null;
+          fetch($u, {credentials: 'include'}).then(async function(r){
+            if (!r.ok) { window.__rawResult = {ok:false, status:r.status}; return; }
+            const b = await r.arrayBuffer();
+            const by = new Uint8Array(b);
+            let bin = '';
+            const CHUNK = 0x8000;
+            for (let i = 0; i < by.length; i += CHUNK) {
+              bin += String.fromCharCode.apply(null, by.subarray(i, i + CHUNK));
+            }
+            window.__rawResult = {
+              ok:true,
+              ct:r.headers.get('content-type')||'',
+              b64:btoa(bin)
+            };
+          }).catch(function(e){ window.__rawResult = {ok:false, err:String(e)}; });
+          return 'started';
+        } catch (e) { return 'throw:' + String(e); }
+      })()
+    ''');
+    if ((started?.toString() ?? '') != 'started') {
+      debugLogMihonCf('raw: kick-off failed for $url: $started');
+      return CfFetchResult.failed(error: 'raw kick-off failed: $started');
+    }
+    Object? picked;
+    for (int i = 0; i < 130; i++) {
+      final Object? v = await c.evaluateJavascript(
+        source: r'window.__rawResult === null ? null : JSON.stringify(window.__rawResult)',
+      );
+      final String s = v?.toString() ?? '';
+      if (s.isNotEmpty && s != 'null') {
+        picked = s;
+        break;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+    }
+    if (picked == null) {
+      debugLogMihonCf('raw: result never arrived for $url');
+      return CfFetchResult.failed(error: 'raw result timeout');
+    }
+    final Map<String, Object?> m;
+    try {
+      m = jsonDecode(picked.toString()) as Map<String, Object?>;
+    } on FormatException {
+      return CfFetchResult.failed(error: 'raw result non-JSON');
+    }
+    if (m['ok'] != true) {
+      debugLogMihonCf('raw: fetch failed for $url: ${m['status'] ?? m['err'] ?? 'n/a'}');
+      return CfFetchResult.failed(
+        error: 'raw fetch failed: ${m['status'] ?? m['err'] ?? 'n/a'}',
+      );
+    }
+    final List<int> bytes;
+    try {
+      bytes = base64.decode(m['b64']?.toString() ?? '');
+    } on FormatException {
+      debugLogMihonCf('raw: base64 decode failed for $url');
+      return CfFetchResult.failed(error: 'raw base64 decode failed');
+    }
+    final String ct = m['ct']?.toString() ?? '';
+    debugLogMihonCf('raw: OK $url bytes=${bytes.length} ct=$ct');
+    return CfFetchResult.rawBytes(
+      bytes,
+      ct.isEmpty ? 'application/octet-stream' : ct,
+    );
   }
 
   Future<CfFetchResult> _fetchImage(InAppWebViewController c, Uri url) async {
