@@ -16,6 +16,7 @@ import kotlinx.coroutines.runBlocking
 import mextensionserver.impl.ExtensionHttpServers
 import mextensionserver.impl.MExtensionServerLoader
 import mextensionserver.impl.MihonInvoker
+import mextensionserver.impl.MirrorRouteOptimizer
 import mextensionserver.model.DataBody
 import mextensionserver.model.FiltersResponse
 
@@ -51,6 +52,8 @@ class DalvikHandler {
                 MExtensionServerLoader.invokeWithExtension(dataBody.data) { loadedExtension ->
                     val selectedSource = MihonInvoker.selectSource(loadedExtension.sources, dataBody)
                     MihonInvoker.preparePreferences(dataBody, selectedSource)
+                    // 首次使用某个源时在后台探测线路；主请求不等它，见 MirrorRouteOptimizer。
+                    MirrorRouteOptimizer.onRequest(dataBody, selectedSource)
                     // Host-owned login session; see [SourceCookieInjection].
                     val domain = SourceCookieInjection.domainOf(selectedSource)
                     SourceCookieInjection.injectRequestCookies(session, selectedSource)
