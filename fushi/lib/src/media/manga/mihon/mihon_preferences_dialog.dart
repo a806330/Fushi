@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 
 import 'package:material_ui/material_ui.dart';
 
@@ -41,6 +43,13 @@ class _MihonPreferencesDialogState extends State<MihonPreferencesDialog> {
   String? _savingKey;
   bool _savingAll = false;
   final Map<String, String> _textDrafts = <String, String>{};
+
+  /// 线路测速结果。只活在弹窗里：不写偏好、不替用户切换线路。
+  final Map<String, _RouteProbe> _routeProbes = <String, _RouteProbe>{};
+  final Set<String> _collapsedRoutes = <String>{};
+  bool _probingRoutes = false;
+  bool _disposed = false;
+  HttpClient? _probeClient;
 
   @override
   void initState() {
@@ -127,6 +136,365 @@ class _MihonPreferencesDialogState extends State<MihonPreferencesDialog> {
   }
 
   @override
+  void dispose() {
+    _disposed = true;
+    _probeClient?.close(force: true);
+    _probeClient = null;
+    super.dispose();
+  }
+
+  String _routeProbeId(MihonPreference preference, int index) =>
+      '${preference.key}#$index';
+
+  bool _routeExpanded(String key) => !_collapsedRoutes.contains(key);
+
+  /// 手动触发一次全线路测速。并发 3 条、单条 4 秒，结果只回填到弹窗。
+  Future<void> _probeRoutes(MihonPreference preference) async {
+    if (_probingRoutes) return;
+    final int count = preference.entries.length;
+    if (count == 0) return;
+    setState(() {
+      _probingRoutes = true;
+      _collapsedRoutes.remove(preference.key);
+      for (int index = 0; index < count; index++) {
+        _routeProbes[_routeProbeId(preference, index)] = const _RouteProbe(
+          _RouteProbeState.pending,
+        );
+      }
+    });
+    final HttpClient client = _probeClient ??= HttpClient()
+      ..connectionTimeout = const Duration(seconds: 4)
+      ..userAgent =
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+          '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+    int cursor = 0;
+    Future<void> lane() async {
+      while (true) {
+        final int index = cursor;
+        cursor++;
+        if (index >= count) return;
+        final String? url = _routeUrlOf(preference, index);
+        final _RouteProbe result = url == null
+            ? const _RouteProbe(_RouteProbeState.failed, null, '无网址')
+            : await _probeOne(client, url);
+        if (_disposed || !mounted) return;
+        setState(() {
+          _routeProbes[_routeProbeId(preference, index)] = result;
+        });
+      }
+    }
+
+    final int lanes = count < 3 ? count : 3;
+    await Future.wait(<Future<void>>[
+      for (int laneIndex = 0; laneIndex < lanes; laneIndex++) lane(),
+    ]);
+    if (_disposed || !mounted) return;
+    setState(() => _probingRoutes = false);
+  }
+
+  /// 单条线路的一次轻量请求：只读前 4KB，计时到首段正文到达。
+  Future<_RouteProbe> _probeOne(HttpClient client, String url) async {
+    final Uri? uri = Uri.tryParse(url);
+    if (uri == null || uri.host.isEmpty) {
+      return const _RouteProbe(_RouteProbeState.failed, null, '网址无效');
+    }
+    final Stopwatch watch = Stopwatch()..start();
+    try {
+      final HttpClientRequest request = await client
+          .getUrl(uri)
+          .timeout(const Duration(seconds: 4));
+      request.followRedirects = true;
+      request.maxRedirects = 5;
+      request.headers.set(HttpHeaders.rangeHeader, 'bytes=0-4095');
+      final HttpClientResponse response = await request
+          .close()
+          .timeout(const Duration(seconds: 4));
+      final List<int> head = <int>[];
+      await for (final List<int> chunk in response.timeout(
+        const Duration(seconds: 4),
+      )) {
+        head.addAll(chunk);
+        if (head.length >= 4096) break;
+      }
+      watch.stop();
+      final int milliseconds = watch.elapsedMilliseconds;
+      final int status = response.statusCode;
+      final String body = utf8.decode(head, allowMalformed: true).toLowerCase();
+      if (status == 403 ||
+          status == 429 ||
+          status == 503 ||
+          body.contains('just a moment') ||
+          body.contains('cf-browser-verification') ||
+          body.contains('checking your browser')) {
+        return _RouteProbe(_RouteProbeState.blocked, milliseconds, null);
+      }
+      if (status >= 400) {
+        return _RouteProbe(
+          _RouteProbeState.failed,
+          milliseconds,
+          'HTTP $status',
+        );
+      }
+      return _RouteProbe(_RouteProbeState.ok, milliseconds, null);
+    } on TimeoutException {
+      watch.stop();
+      return const _RouteProbe(_RouteProbeState.timeout);
+    } on Object {
+      watch.stop();
+      return const _RouteProbe(_RouteProbeState.failed);
+    }
+  }
+
+  // ---- 线路偏好识别 ---------------------------------------------------------
+
+  /// 列表偏好里至少两条候选能解析出网址，才当成线路清单。
+  ///
+  /// 有的源 `entryValues` 直接是网址；有的源 `entryValues` 只是编号、网址写在
+  /// `entries` 的显示名里——两种都认，不绑死任何源。
+  bool _looksLikeRouteList(MihonPreference preference) {
+    if (preference.kind != MihonPreferenceKind.list) return false;
+    int resolved = 0;
+    for (int index = 0; index < preference.entries.length; index++) {
+      if (_routeUrlOf(preference, index) != null) {
+        resolved++;
+        if (resolved >= 2) return true;
+      }
+    }
+    return false;
+  }
+
+  String _routeRawValue(MihonPreference preference, int index) {
+    if (index < preference.entryValues.length) {
+      final String value = preference.entryValues[index].trim();
+      if (value.isNotEmpty) return value;
+    }
+    return index < preference.entries.length ? preference.entries[index] : '';
+  }
+
+  String _routeLabel(MihonPreference preference, int index) {
+    final String label = index < preference.entries.length
+        ? preference.entries[index].trim()
+        : '';
+    if (label.isNotEmpty) return label;
+    return _routeRawValue(preference, index);
+  }
+
+  String? _routeUrlOf(MihonPreference preference, int index) =>
+      _cleanRouteUrl(_routeRawValue(preference, index)) ??
+      _cleanRouteUrl(_routeLabel(preference, index));
+
+  static final RegExp _routeUrlPattern = RegExp(
+    r'https?://[^\s"<>，,]+',
+    caseSensitive: false,
+  );
+  static final RegExp _routeHostPattern = RegExp(
+    r'(?:^|[\s(（,，:：])((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,})',
+    caseSensitive: false,
+  );
+
+  String? _cleanRouteUrl(String raw) {
+    final String text = raw.trim();
+    if (text.isEmpty) return null;
+    final RegExpMatch? urlMatch = _routeUrlPattern.firstMatch(text);
+    final RegExpMatch? hostMatch = urlMatch == null
+        ? _routeHostPattern.firstMatch(text)
+        : null;
+    final String? found = (urlMatch?.group(0) ?? hostMatch?.group(1))?.trim();
+    if (found == null || found.isEmpty) return null;
+    final String lower = found.toLowerCase();
+    final String cleaned = _trimRouteTail(
+      lower.startsWith('http://') || lower.startsWith('https://')
+          ? found
+          : 'https://$found',
+    );
+    final Uri? uri = Uri.tryParse(cleaned);
+    if (uri == null || uri.host.isEmpty || !uri.host.contains('.')) return null;
+    if (RegExp(r'\s').hasMatch(uri.host)) return null;
+    return cleaned;
+  }
+
+  String _trimRouteTail(String input) {
+    const String tails = "，,;；)）]}\"'>。.";
+    int end = input.length;
+    while (end > 0 && tails.contains(input[end - 1])) {
+      end--;
+    }
+    return input.substring(0, end);
+  }
+
+  // ---- 线路选择区渲染 -------------------------------------------------------
+
+  Widget _buildRoutePicker(MihonPreference preference, bool busy) {
+    final ThemeData theme = Theme.of(context);
+    final int count = preference.entries.length;
+    final int current = (preference.value as int? ?? 0).clamp(0, count - 1);
+    final bool expanded = _routeExpanded(preference.key);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          InkWell(
+            borderRadius: BorderRadius.circular(8),
+            onTap: () => setState(() {
+              if (expanded) {
+                _collapsedRoutes.add(preference.key);
+              } else {
+                _collapsedRoutes.remove(preference.key);
+              }
+            }),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+              child: Row(
+                children: <Widget>[
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Text(
+                          preference.title,
+                          style: theme.textTheme.bodyLarge,
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          '当前：${_routeLabel(preference, current)}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  FushiTextButton(
+                    onPressed: busy || _probingRoutes
+                        ? null
+                        : () => unawaited(_probeRoutes(preference)),
+                    child: Text(_probingRoutes ? '测速中' : '测速'),
+                  ),
+                  Icon(
+                    expanded ? Icons.expand_less : Icons.expand_more,
+                    size: 20,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (expanded)
+            for (int index = 0; index < count; index++)
+              _buildRouteRow(preference, index, index == current, busy),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildRouteRow(
+    MihonPreference preference,
+    int index,
+    bool selected,
+    bool busy,
+  ) {
+    final ThemeData theme = Theme.of(context);
+    final _RouteProbe? probe = _routeProbes[_routeProbeId(preference, index)];
+    final String? url = _routeUrlOf(preference, index);
+    final String label = _routeLabel(preference, index);
+    return InkWell(
+      onTap: busy ? null : () => unawaited(_save(preference, index)),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 9),
+        child: Row(
+          children: <Widget>[
+            Icon(
+              selected
+                  ? Icons.radio_button_checked
+                  : Icons.radio_button_unchecked,
+              size: 18,
+              color: selected
+                  ? theme.colorScheme.primary
+                  : theme.colorScheme.onSurfaceVariant,
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.bodyMedium,
+                  ),
+                  if (url != null && url != label)
+                    Text(
+                      url,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 12),
+            _buildRouteSpeed(theme, probe),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildRouteSpeed(ThemeData theme, _RouteProbe? probe) {
+    final TextStyle? base = theme.textTheme.bodySmall;
+    if (probe == null) {
+      return Text(
+        '—',
+        style: base?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+      );
+    }
+    if (probe.state == _RouteProbeState.pending) {
+      return const SizedBox(
+        width: 14,
+        height: 14,
+        child: CircularProgressIndicator(strokeWidth: 1.6),
+      );
+    }
+    if (probe.state == _RouteProbeState.ok) {
+      final int milliseconds = probe.milliseconds ?? 0;
+      return Text(
+        '$milliseconds ms',
+        style: base?.copyWith(color: _routeSpeedColor(theme, milliseconds)),
+      );
+    }
+    if (probe.state == _RouteProbeState.blocked) {
+      return Text(
+        '拦截',
+        style: base?.copyWith(color: theme.colorScheme.tertiary),
+      );
+    }
+    if (probe.state == _RouteProbeState.timeout) {
+      return Text(
+        '超时',
+        style: base?.copyWith(color: theme.colorScheme.error),
+      );
+    }
+    return Text(
+      probe.note ?? '失败',
+      style: base?.copyWith(color: theme.colorScheme.error),
+    );
+  }
+
+  Color _routeSpeedColor(ThemeData theme, int milliseconds) {
+    if (milliseconds <= 1200) return const Color(0xFF43A047);
+    if (milliseconds <= 3000) return const Color(0xFFFB8C00);
+    return theme.colorScheme.error;
+  }
+
+  @override
   Widget build(BuildContext context) {
     final List<MihonPreference>? preferences = _preferences;
     return FushiAlertDialog(
@@ -194,26 +562,30 @@ class _MihonPreferencesDialogState extends State<MihonPreferencesDialog> {
               unawaited(_save(preference, value)),
         ),
       ),
-      MihonPreferenceKind.list => FushiDropdownButtonFormField<int>(
-        value: (preference.value as int? ?? 0).clamp(
-          0,
-          preference.entries.length - 1,
-        ),
-        decoration: InputDecoration(
-          labelText: preference.title,
-          helperText: preference.summary.isEmpty ? null : preference.summary,
-        ),
-        items: <DropdownMenuItem<int>>[
-          for (int index = 0; index < preference.entries.length; index++)
-            DropdownMenuItem<int>(
-              value: index,
-              child: Text(preference.entries[index]),
+      MihonPreferenceKind.list => _looksLikeRouteList(preference)
+          ? _buildRoutePicker(preference, busy)
+          : FushiDropdownButtonFormField<int>(
+              value: (preference.value as int? ?? 0).clamp(
+                0,
+                preference.entries.length - 1,
+              ),
+              decoration: InputDecoration(
+                labelText: preference.title,
+                helperText: preference.summary.isEmpty
+                    ? null
+                    : preference.summary,
+              ),
+              items: <DropdownMenuItem<int>>[
+                for (int index = 0; index < preference.entries.length; index++)
+                  DropdownMenuItem<int>(
+                    value: index,
+                    child: Text(preference.entries[index]),
+                  ),
+              ],
+              onChanged: busy
+                  ? null
+                  : (int? value) => unawaited(_save(preference, value ?? 0)),
             ),
-        ],
-        onChanged: busy
-            ? null
-            : (int? value) => unawaited(_save(preference, value ?? 0)),
-      ),
       MihonPreferenceKind.multiSelect => FushiExpansionTile(
         title: Text(preference.title),
         subtitle: preference.summary.isEmpty ? null : Text(preference.summary),
@@ -277,4 +649,15 @@ class _MihonMultiSelectRow extends StatelessWidget {
       onTap: changed == null ? null : () => changed(!selected),
     );
   }
+}
+
+/// 一条线路的测速结果：只用于弹窗展示。
+enum _RouteProbeState { pending, ok, blocked, timeout, failed }
+
+class _RouteProbe {
+  const _RouteProbe(this.state, [this.milliseconds, this.note]);
+
+  final _RouteProbeState state;
+  final int? milliseconds;
+  final String? note;
 }
