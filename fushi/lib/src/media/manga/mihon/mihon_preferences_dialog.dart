@@ -179,10 +179,12 @@ class _MihonPreferencesDialogState extends State<MihonPreferencesDialog> {
     });
     _probeClient?.close(force: true);
     _proxyClient?.close(force: true);
-    final HttpClient direct = HttpClient()
+    // 级联链里的箭头函数必须加括号，否则 `=> 'DIRECT' ..userAgent = ...`
+    // 会被解析成对字符串赋值，编译器报 userAgent 不是 String 的 setter。
+    final HttpClient direct = (HttpClient()
       ..connectionTimeout = _routeDirectTimeout
-      ..findProxy = (Uri uri) => 'DIRECT'
-      ..userAgent = _routeUserAgent;
+      ..userAgent = _routeUserAgent
+      ..findProxy = ((Uri uri) => 'DIRECT'));
     final HttpClient viaApp = HttpClient()
       ..connectionTimeout = _routeProxyTimeout
       ..userAgent = _routeUserAgent;
