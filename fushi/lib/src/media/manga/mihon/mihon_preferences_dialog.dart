@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:fushi_engine/utils/net/app_proxy.dart';
 import 'package:material_ui/material_ui.dart';
 
 import 'package:fushi/src/utils/components/glass/fushi_icon.dart';
@@ -49,9 +50,7 @@ class _MihonPreferencesDialogState extends State<MihonPreferencesDialog> {
   final Set<String> _collapsedRoutes = <String>{};
   bool _probingRoutes = false;
   bool _disposed = false;
-  bool _probeViaProxy = false;
   HttpClient? _probeClient;
-  HttpClient? _directClient;
 
   static const Duration _routeProbeTimeout = Duration(seconds: 6);
   static const String _routeUserAgent =
@@ -147,8 +146,6 @@ class _MihonPreferencesDialogState extends State<MihonPreferencesDialog> {
     _disposed = true;
     _probeClient?.close(force: true);
     _probeClient = null;
-    _directClient?.close(force: true);
-    _directClient = null;
     super.dispose();
   }
 
@@ -171,24 +168,19 @@ class _MihonPreferencesDialogState extends State<MihonPreferencesDialog> {
         );
       }
     });
-    // 跟着本机系统代理走，才能和真实抓取同一条通道（Clash 规则再决定
-    // 直连还是转发）。代理不通时由 _probeOne 回退直连重试。
-    final String? proxy = await _SystemProxy.resolve();
-    if (_disposed || !mounted) return;
     _probeClient?.close(force: true);
-    _directClient?.close(force: true);
     final HttpClient client = HttpClient()
       ..connectionTimeout = _routeProbeTimeout
-      ..findProxy = (Uri uri) => proxy == null ? 'DIRECT' : 'PROXY $proxy'
       ..userAgent = _routeUserAgent;
+    // 走全应用同一份出站代理裁决，测速与真实抓取必然同一条通道：用户选
+    // 自动就是系统代理（Clash 之类按自家规则决定直连还是转发），选直连才
+    // 直连。测出来的数因此与「选这条线路后能不能真的刷出内容」一致。
+    await applyAppProxy(client);
+    if (_disposed || !mounted) {
+      client.close(force: true);
+      return;
+    }
     _probeClient = client;
-    _probeViaProxy = proxy != null;
-    _directClient = proxy == null
-        ? null
-        : (HttpClient()
-            ..connectionTimeout = _routeProbeTimeout
-            ..findProxy = (Uri uri) => 'DIRECT'
-            ..userAgent = _routeUserAgent);
 
     int cursor = 0;
     Future<void> lane() async {
@@ -218,21 +210,14 @@ class _MihonPreferencesDialogState extends State<MihonPreferencesDialog> {
   /// 单条线路的一次轻量请求：只读前 4KB，计时到首段正文到达。
   ///
   /// 判据是「有没有拿到 HTTP 响应」，不是状态码：不少镜像对根路径故意回
-  /// 500/403 的反爬占位页，线路其实是通的。先走系统代理（与真实抓取同通
-  /// 道），连接层失败再直连重试一次。
+  /// 500/403 的反爬占位页，线路其实是通的，用状态码判会把能用的线路判死。
   Future<_RouteProbe> _probeOne(HttpClient client, String url) async {
     final Uri? uri = Uri.tryParse(url);
     if (uri == null || uri.host.isEmpty) {
       return const _RouteProbe(_RouteProbeState.failed, null, '网址无效');
     }
-    final _RouteProbe? first = await _probeOnce(client, uri);
-    if (first != null) return first;
-    final HttpClient? direct = _directClient;
-    if (!_probeViaProxy || direct == null) {
-      return const _RouteProbe(_RouteProbeState.failed);
-    }
-    return await _probeOnce(direct, uri) ??
-        const _RouteProbe(_RouteProbeState.failed);
+    return await _probeOnce(client, uri) ??
+        const _RouteProbe(_RouteProbeState.failed, null, '连接失败');
   }
 
   /// 返回 null 表示连接层没通（可以换通道重试）；其余都带结论。
@@ -707,98 +692,3 @@ class _RouteProbe {
   final String? note;
 }
 
-/// 读出本机系统代理，让测速与真实抓取走同一条通道。
-///
-/// Dart 自带的 `findProxyFromEnvironment` 只认环境变量，而 Windows 的系
-/// 统代理写在注册表里（Clash Verge 等工具只改注册表），所以这里补一条注
-/// 册表读取。不硬编码任何端口：读不到就当没有代理，测速退回直连。
-class _SystemProxy {
-  const _SystemProxy._();
-
-  static String? _cached;
-  static bool _resolved = false;
-
-  static Future<String?> resolve() async {
-    if (_resolved) return _cached;
-    _resolved = true;
-    _cached = _fromEnvironment() ?? await _fromWindowsRegistry();
-    return _cached;
-  }
-
-  static String? _fromEnvironment() {
-    for (final String key in const <String>[
-      'https_proxy',
-      'HTTPS_PROXY',
-      'http_proxy',
-      'HTTP_PROXY',
-      'all_proxy',
-      'ALL_PROXY',
-    ]) {
-      final String? value = Platform.environment[key];
-      if (value != null && value.trim().isNotEmpty) {
-        final String? parsed = _normalize(value);
-        if (parsed != null) return parsed;
-      }
-    }
-    return null;
-  }
-
-  static Future<String?> _fromWindowsRegistry() async {
-    if (!Platform.isWindows) return null;
-    try {
-      final ProcessResult result = await Process.run(
-        'reg',
-        <String>[
-          'query',
-          r'HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings',
-        ],
-        stdoutEncoding: null,
-        stderrEncoding: null,
-      );
-      if (result.exitCode != 0) return null;
-      final Object? raw = result.stdout;
-      if (raw is! List<int>) return null;
-      // reg 输出是本地代码页，中文会乱；这里只解析 ASCII 字段，按字节直转即可。
-      final String text = String.fromCharCodes(raw);
-      final RegExpMatch? enabled = RegExp(
-        r'ProxyEnable\s+REG_DWORD\s+0x([0-9a-fA-F]+)',
-      ).firstMatch(text);
-      if (enabled == null) return null;
-      if (int.parse(enabled.group(1)!, radix: 16) == 0) return null;
-      final RegExpMatch? server = RegExp(
-        r'ProxyServer\s+REG_SZ\s+(\S+)',
-      ).firstMatch(text);
-      if (server == null) return null;
-      return _normalize(server.group(1)!);
-    } on Object {
-      return null;
-    }
-  }
-
-  /// 收敛成 `host:port`。`http=a;https=b` 形式优先取 https。
-  static String? _normalize(String raw) {
-    String value = raw.trim();
-    if (value.isEmpty) return null;
-    if (value.contains('=')) {
-      String? picked;
-      for (final String part in value.split(';')) {
-        final int eq = part.indexOf('=');
-        if (eq <= 0) continue;
-        final String scheme = part.substring(0, eq).trim().toLowerCase();
-        final String target = part.substring(eq + 1).trim();
-        if (target.isEmpty) continue;
-        if (scheme == 'https') {
-          picked = target;
-          break;
-        }
-        picked ??= target;
-      }
-      if (picked == null) return null;
-      value = picked;
-    }
-    value = value.replaceFirst(RegExp(r'^[a-zA-Z][a-zA-Z0-9+.\-]*://'), '');
-    value = value.split('/').first.trim();
-    if (!value.contains(':')) return null;
-    return value;
-  }
-}
