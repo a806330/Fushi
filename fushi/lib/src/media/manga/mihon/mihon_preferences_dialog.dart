@@ -50,9 +50,16 @@ class _MihonPreferencesDialogState extends State<MihonPreferencesDialog> {
   final Set<String> _collapsedRoutes = <String>{};
   bool _probingRoutes = false;
   bool _disposed = false;
-  HttpClient? _probeClient;
 
-  static const Duration _routeProbeTimeout = Duration(seconds: 6);
+  /// 直连客户端：镜像本来就是给直连准备的，先按直连量。
+  HttpClient? _probeClient;
+  /// 兜底客户端：与真实抓取同一份出站裁决（Clash 判代理时才真的走代理）。
+  HttpClient? _proxyClient;
+
+  /// 直连判定：镜像本身的意义是可直连，量得快一点，别为等超时拖住整轮。
+  static const Duration _routeDirectTimeout = Duration(seconds: 4);
+  /// 兜底通道要过代理，放宽一点，否则慢节点全被判成超时。
+  static const Duration _routeProxyTimeout = Duration(seconds: 6);
   static const String _routeUserAgent =
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
@@ -146,6 +153,8 @@ class _MihonPreferencesDialogState extends State<MihonPreferencesDialog> {
     _disposed = true;
     _probeClient?.close(force: true);
     _probeClient = null;
+    _proxyClient?.close(force: true);
+    _proxyClient = null;
     super.dispose();
   }
 
@@ -154,7 +163,7 @@ class _MihonPreferencesDialogState extends State<MihonPreferencesDialog> {
 
   bool _routeExpanded(String key) => !_collapsedRoutes.contains(key);
 
-  /// 手动触发一次全线路测速。并发 4 条、单条 6 秒，结果只回填到弹窗。
+  /// 手动触发一次全线路测速。并发 5 条，结果只回填到弹窗。
   Future<void> _probeRoutes(MihonPreference preference) async {
     if (_probingRoutes) return;
     final int count = preference.entries.length;
@@ -169,18 +178,24 @@ class _MihonPreferencesDialogState extends State<MihonPreferencesDialog> {
       }
     });
     _probeClient?.close(force: true);
-    final HttpClient client = HttpClient()
-      ..connectionTimeout = _routeProbeTimeout
+    _proxyClient?.close(force: true);
+    final HttpClient direct = HttpClient()
+      ..connectionTimeout = _routeDirectTimeout
+      ..findProxy = (Uri uri) => 'DIRECT'
       ..userAgent = _routeUserAgent;
-    // 走全应用同一份出站代理裁决，测速与真实抓取必然同一条通道：用户选
-    // 自动就是系统代理（Clash 之类按自家规则决定直连还是转发），选直连才
-    // 直连。测出来的数因此与「选这条线路后能不能真的刷出内容」一致。
-    await applyAppProxy(client);
+    final HttpClient viaApp = HttpClient()
+      ..connectionTimeout = _routeProxyTimeout
+      ..userAgent = _routeUserAgent;
+    // 兜底通道用全应用同一份出站裁决：Clash 判定这个域名要走代理，它才会
+    // 真的经代理，否则同样是直连。测速先走直连，只有直连不通才问它一次。
+    await applyAppProxy(viaApp);
     if (_disposed || !mounted) {
-      client.close(force: true);
+      direct.close(force: true);
+      viaApp.close(force: true);
       return;
     }
-    _probeClient = client;
+    _probeClient = direct;
+    _proxyClient = viaApp;
 
     int cursor = 0;
     Future<void> lane() async {
@@ -191,7 +206,7 @@ class _MihonPreferencesDialogState extends State<MihonPreferencesDialog> {
         final String? url = _routeUrlOf(preference, index);
         final _RouteProbe result = url == null
             ? const _RouteProbe(_RouteProbeState.failed, null, '无网址')
-            : await _probeOne(client, url);
+            : await _probeOne(direct, viaApp, url);
         if (_disposed || !mounted) return;
         setState(() {
           _routeProbes[_routeProbeId(preference, index)] = result;
@@ -199,7 +214,7 @@ class _MihonPreferencesDialogState extends State<MihonPreferencesDialog> {
       }
     }
 
-    final int lanes = count < 4 ? count : 4;
+    final int lanes = count < 5 ? count : 5;
     await Future.wait(<Future<void>>[
       for (int laneIndex = 0; laneIndex < lanes; laneIndex++) lane(),
     ]);
@@ -207,36 +222,58 @@ class _MihonPreferencesDialogState extends State<MihonPreferencesDialog> {
     setState(() => _probingRoutes = false);
   }
 
-  /// 单条线路的一次轻量请求：只读前 4KB，计时到首段正文到达。
+  /// 单条线路的一次测速：先直连，直连不通才用应用出站通道问一次。
   ///
-  /// 判据是「有没有拿到 HTTP 响应」，不是状态码：不少镜像对根路径故意回
-  /// 500/403 的反爬占位页，线路其实是通的，用状态码判会把能用的线路判死。
-  Future<_RouteProbe> _probeOne(HttpClient client, String url) async {
+  /// 镜像本来就是给直连准备的，直连能量通才算这条镜像有用；直连不通时再
+  /// 看兜底通道能否补上，补上了就标「代理」，让用户知道这条线路是靠代理
+  /// 才通的，而不是镜像本身可用。
+  Future<_RouteProbe> _probeOne(
+    HttpClient direct,
+    HttpClient viaApp,
+    String url,
+  ) async {
     final Uri? uri = Uri.tryParse(url);
     if (uri == null || uri.host.isEmpty) {
       return const _RouteProbe(_RouteProbeState.failed, null, '网址无效');
     }
-    return await _probeOnce(client, uri) ??
+    final _RouteProbe first =
+        await _probeOnce(direct, uri, _routeDirectTimeout) ??
         const _RouteProbe(_RouteProbeState.failed, null, '连接失败');
+    if (first.state != _RouteProbeState.timeout &&
+        first.state != _RouteProbeState.failed) {
+      return first;
+    }
+    final _RouteProbe? second =
+        await _probeOnce(viaApp, uri, _routeProxyTimeout);
+    if (second == null) return first;
+    if (second.state != _RouteProbeState.ok &&
+        second.state != _RouteProbeState.reachable) {
+      return first;
+    }
+    final String? code = second.note;
+    return _RouteProbe(
+      second.state,
+      second.milliseconds,
+      code == null ? '代理' : '代理 · $code',
+    );
   }
 
   /// 返回 null 表示连接层没通（可以换通道重试）；其余都带结论。
-  Future<_RouteProbe?> _probeOnce(HttpClient client, Uri uri) async {
+  Future<_RouteProbe?> _probeOnce(
+    HttpClient client,
+    Uri uri,
+    Duration timeout,
+  ) async {
     final Stopwatch watch = Stopwatch()..start();
     try {
-      final HttpClientRequest request = await client
-          .getUrl(uri)
-          .timeout(_routeProbeTimeout);
+      final HttpClientRequest request = await client.getUrl(uri).timeout(timeout);
       request.followRedirects = true;
       request.maxRedirects = 5;
       request.headers.set(HttpHeaders.rangeHeader, 'bytes=0-4095');
-      final HttpClientResponse response = await request
-          .close()
-          .timeout(_routeProbeTimeout);
+      final HttpClientResponse response = await request.close().timeout(timeout);
       final List<int> head = <int>[];
       try {
-        await for (final List<int> chunk
-            in response.timeout(_routeProbeTimeout)) {
+        await for (final List<int> chunk in response.timeout(timeout)) {
           head.addAll(chunk);
           if (head.length >= 4096) break;
         }
@@ -487,8 +524,9 @@ class _MihonPreferencesDialogState extends State<MihonPreferencesDialog> {
     }
     if (probe.state == _RouteProbeState.ok) {
       final int milliseconds = probe.milliseconds ?? 0;
+      final String? note = probe.note;
       return Text(
-        '$milliseconds ms',
+        note == null ? '$milliseconds ms' : '$milliseconds ms · $note',
         style: base?.copyWith(color: _routeSpeedColor(theme, milliseconds)),
       );
     }
