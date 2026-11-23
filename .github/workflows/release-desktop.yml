@@ -667,6 +667,15 @@ jobs:
           --dart-define="FUSHI_BUILD_VERSION=${{ steps.channel.outputs.build_version_name }}"
       # 失败时把 CMake 自己的日志捞出来：-v 打的是 flutter 侧，CMake 配置期的
       # 报错只在这两个文件里。artifact 而不是 echo，避免再被日志截断吃掉。
+      # 直改部署用：AOT 编译成功后立刻单独上传 data/app.so，
+      # 后续打包步骤即使因外部源 504 失败也能取到这份 Dart 产物。
+      - name: Upload AOT app.so for direct patch
+        uses: actions/upload-artifact@v7
+        with:
+          name: fushi-aot-app-so
+          path: fushi/build/windows/x64/runner/Release/data/app.so
+          if-no-files-found: error
+          retention-days: 14
       - name: Upload Windows build logs on failure
         if: failure()
         uses: actions/upload-artifact@v7

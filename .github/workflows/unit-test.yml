@@ -1,0 +1,52 @@
+name: CF Delegation Unit Test
+
+# 云端验证第一层：纯逻辑单测（不联网、不需浏览器）。
+# 仅在我们改动的 CF 代发相关文件或本 workflow 变动时触发，避免每次 push 都跑。
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/download-330]
+    paths:
+      - 'fushi/lib/src/media/manga/mihon/mihon_cf_*.dart'
+      - 'fushi/test/mihon_cf_delegation_test.dart'
+      - '.github/workflows/unit-test.yml'
+
+jobs:
+  unit-test:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Flutter (stable 3.47.6)
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.6'
+          channel: 'stable'
+
+      - name: flutter pub get
+        working-directory: fushi
+        run: flutter pub get
+
+      # 补丁必须在 flutter pub get 之后跑：apply-patches.sh 是往 pub-cache 里已经
+      # 下载好的包目录里覆盖修复文件，目录按精确版本命名（如 dartssh2-2.11.0）。
+      # 若放在 pub get 之前，pub-cache 还是空的，脚本会把补丁全部跳过，结果
+      # dartssh2 / pdfrx_engine / media_kit 三处修复没打上，整包编译就报错。
+      # 顺序与发布构建 release-desktop.yml 的「pub get → apply patches」保持一致。
+      - name: Apply pub cache patches
+        shell: bash
+        run: |
+          chmod +x ci/apply-patches.sh
+          bash ci/apply-patches.sh
+
+      - name: Generate i18n
+        # strings.g.dart 是未跟踪的生成文件，所有在 fushi/ 下 analyze/test 的前置步骤。
+        # 与发布构建一致用 composite action（在 repo root 跑 dart fushi/tool/gen_i18n.dart）。
+        uses: ./.github/actions/gen-i18n
+
+      - name: analyze delegation
+        working-directory: fushi
+        run: flutter analyze lib/src/media/manga/mihon/mihon_cf_delegation.dart
+
+      - name: run delegation unit test
+        working-directory: fushi
+        run: flutter test test/mihon_cf_delegation_test.dart

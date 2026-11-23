@@ -159,6 +159,11 @@ DownloadTaskEntry mangaDownloadTaskEntry(
       retry: retryable ? () => downloads.retry(job.jobId) : null,
       clear: finished ? () => downloads.remove(job.jobId) : null,
       cancel: finished ? null : () => downloads.cancel(job.jobId),
+      // 定制：删除任务时按用户勾选连带清掉明文导出目录
+      // <root>/<作品名>/<章名>/，并在作品目录空时自动收掉。
+      delete: ({required bool deleteFiles}) =>
+          downloads.deleteJob(job.jobId, deleteFiles: deleteFiles),
+      deletesFiles: true,
     ),
     builder: (BuildContext context) => DownloadTaskCard(
       key: ValueKey<String>(id),
